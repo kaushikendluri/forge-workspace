@@ -1,0 +1,50 @@
+[package]
+name = "forge-workspace"
+version = "0.1.0"
+description = "Forge Workspace — desktop app for orchestrating coding agents in isolated git worktrees"
+authors = ["Kaushik"]
+edition = "2021"
+rust-version = "1.77"
+
+# See https://tauri.app/v1/api/config/#buildconfig for the build script config
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled", "chrono", "uuid"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.25"
+
+# HTTP client (Anthropic API calls, later milestones)
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# Identifiers & timestamps
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# OS keychain access for API keys (M4)
+keyring = "3"
+
+# Cross-platform PTY for the Terminal tab (M3)
+portable-pty = "0.8"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "forge-workspace"
+path = "src/main.rs"
+
+[lib]
+name = "forge_workspace_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]

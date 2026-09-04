@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Forge Workspace</title>
+    <script>
+      // Apply persisted theme before first paint to avoid a dark->light flash.
+      // Kept in sync with src/stores/useSettingsStore.ts's persisted shape.
+      (function () {
+        try {
+          var raw = localStorage.getItem("forge-settings");
+          if (raw) {
+            var theme = JSON.parse(raw).state.theme;
+            if (theme === "light") document.documentElement.classList.add("light");
+          }
+        } catch (e) {
+          /* ignore — default dark palette applies */
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
