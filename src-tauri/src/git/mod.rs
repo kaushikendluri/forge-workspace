@@ -47,6 +47,19 @@ pub struct BranchInfo {
     pub is_current: bool,
 }
 
+/// One entry from `git worktree list --porcelain`, for reconciling the
+/// `workspaces` DB table against what's actually on disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeInfo {
+    pub path: String,
+    /// `None` for a detached-HEAD worktree (or a bare repository's own
+    /// entry), matching `git worktree list --porcelain`'s `detached`/`bare`
+    /// lines carrying no `branch <ref>` line.
+    pub branch: Option<String>,
+    pub head_sha: String,
+}
+
 /// Full before/after file text for the Changes tab's Monaco diff viewer.
 /// Built from `git show HEAD:<path>` (original) + the working-tree file
 /// (modified) rather than a parsed unified patch — simpler, and Monaco wants
@@ -99,23 +112,29 @@ pub trait GitService: Send + Sync {
     fn init(&self, path: &Path) -> AppResult<()>;
 
     /// Creates a new worktree at `worktree_path` on a new branch
-    /// `branch_name`, for isolating one agent's changes from the primary
-    /// checkout. Default body panics — implemented in M3.
+    /// `branch_name`, based on `base_branch`, for isolating one agent's
+    /// changes from the primary checkout. Surfaces git's real stderr on
+    /// failure (branch already exists, `worktree_path` already
+    /// exists/non-empty, `base_branch` doesn't exist, ...) rather than a
+    /// generic message.
     fn add_worktree(
         &self,
-        _repo_root: &Path,
-        _worktree_path: &Path,
-        _branch_name: &str,
-        _base_branch: &str,
-    ) -> AppResult<()> {
-        todo!("M3: git worktree add -b <branch_name> <worktree_path> <base_branch>")
-    }
+        repo_root: &Path,
+        worktree_path: &Path,
+        branch_name: &str,
+        base_branch: &str,
+    ) -> AppResult<()>;
 
-    /// Removes a worktree previously created by `add_worktree`. Default
-    /// body panics — implemented in M3.
-    fn remove_worktree(&self, _repo_root: &Path, _worktree_path: &Path) -> AppResult<()> {
-        todo!("M3: git worktree remove <worktree_path>")
-    }
+    /// Removes a worktree previously created by `add_worktree`. Deliberately
+    /// does *not* pass `--force`: if the worktree has uncommitted changes,
+    /// git refuses and this lets that error surface honestly rather than
+    /// silently discarding an agent's work.
+    fn remove_worktree(&self, repo_root: &Path, worktree_path: &Path) -> AppResult<()>;
+
+    /// All worktrees (primary + agent) registered against `repo_root`,
+    /// parsed from `git worktree list --porcelain` — used to reconcile the
+    /// `workspaces` DB table against what's actually on disk.
+    fn list_worktrees(&self, repo_root: &Path) -> AppResult<Vec<WorktreeInfo>>;
 
     /// Full before/after text for `path`, for the Changes tab's diff viewer.
     /// Handles new files (no `HEAD` version) and deleted files (no
@@ -236,6 +255,41 @@ impl GitService for GitCliService {
 
     fn init(&self, path: &Path) -> AppResult<()> {
         self.run(path, &["init"]).map(|_| ())
+    }
+
+    fn add_worktree(
+        &self,
+        repo_root: &Path,
+        worktree_path: &Path,
+        branch_name: &str,
+        base_branch: &str,
+    ) -> AppResult<()> {
+        let worktree_path_str = worktree_path.to_string_lossy().to_string();
+        self.run(
+            repo_root,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                branch_name,
+                worktree_path_str.as_str(),
+                base_branch,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn remove_worktree(&self, repo_root: &Path, worktree_path: &Path) -> AppResult<()> {
+        let worktree_path_str = worktree_path.to_string_lossy().to_string();
+        // Intentionally no `--force`: a dirty worktree should make this fail
+        // with git's own error, not silently discard the agent's changes.
+        self.run(repo_root, &["worktree", "remove", worktree_path_str.as_str()])?;
+        Ok(())
+    }
+
+    fn list_worktrees(&self, repo_root: &Path) -> AppResult<Vec<WorktreeInfo>> {
+        let raw = self.run(repo_root, &["worktree", "list", "--porcelain"])?;
+        Ok(parse_worktree_list(&String::from_utf8_lossy(&raw)))
     }
 
     fn diff_file(&self, repo_root: &Path, path: &str) -> AppResult<GitFileDiff> {
@@ -387,6 +441,47 @@ fn push_status_entry(status: &mut GitStatus, xy: &str, path: String) {
     }
 }
 
+/// Parses `git worktree list --porcelain` output: one block per worktree
+/// (`worktree <path>`, `HEAD <sha>`, then either `branch <ref>` or a bare
+/// `detached`/`bare` line), blocks separated by a blank line. A trailing
+/// sentinel blank line is appended so the last block is flushed the same way
+/// as every other one, whether or not git's own output ends in one.
+fn parse_worktree_list(raw: &str) -> Vec<WorktreeInfo> {
+    let mut result = Vec::new();
+    let mut path: Option<String> = None;
+    let mut head_sha: Option<String> = None;
+    let mut branch: Option<String> = None;
+
+    for line in raw.lines().chain(std::iter::once("")) {
+        if line.is_empty() {
+            if let (Some(path), Some(head_sha)) = (path.take(), head_sha.take()) {
+                result.push(WorktreeInfo {
+                    path,
+                    branch: branch.take(),
+                    head_sha,
+                });
+            }
+            branch = None;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("worktree ") {
+            path = Some(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("HEAD ") {
+            head_sha = Some(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("branch ") {
+            branch = Some(
+                rest.strip_prefix("refs/heads/")
+                    .unwrap_or(rest)
+                    .to_string(),
+            );
+        }
+        // "detached", "bare", "locked"/"locked <reason>", "prunable
+        // <reason>" lines carry no data this struct needs.
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,5 +510,113 @@ mod tests {
         assert_eq!(status.staged.len(), 1);
         assert_eq!(status.staged[0].path, "new_name.rs <- old_name.rs");
         assert_eq!(status.staged[0].status_code, "R");
+    }
+
+    #[test]
+    fn parses_worktree_list_with_branch_and_detached_entries() {
+        let raw = "worktree /repo\nHEAD abc123\nbranch refs/heads/main\n\nworktree /repo/.forge-workspace/worktrees/run1\nHEAD def456\nbranch refs/heads/forge/agent/tester/run1\n\nworktree /repo-detached\nHEAD 789abc\ndetached\n";
+        let worktrees = parse_worktree_list(raw);
+        assert_eq!(worktrees.len(), 3);
+        assert_eq!(worktrees[0].path, "/repo");
+        assert_eq!(worktrees[0].branch.as_deref(), Some("main"));
+        assert_eq!(worktrees[1].branch.as_deref(), Some("forge/agent/tester/run1"));
+        assert_eq!(worktrees[2].head_sha, "789abc");
+        assert_eq!(worktrees[2].branch, None);
+    }
+
+    /// A minimal real git repository in a tempdir, with one commit on its
+    /// default branch — shared setup for the worktree lifecycle tests below,
+    /// which shell out to the real `git` binary rather than mocking it.
+    fn init_test_repo() -> (tempfile::TempDir, GitCliService, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let service = GitCliService {
+            git_path: PathBuf::from("git"),
+        };
+        service.run(dir.path(), &["init"]).expect("git init");
+        service
+            .run(dir.path(), &["config", "user.email", "test@example.com"])
+            .expect("git config email");
+        service
+            .run(dir.path(), &["config", "user.name", "Test"])
+            .expect("git config name");
+        std::fs::write(dir.path().join("README.md"), "hello\n").expect("write README");
+        service.run(dir.path(), &["add", "."]).expect("git add");
+        service
+            .run(dir.path(), &["commit", "-m", "init"])
+            .expect("git commit");
+        let branch = service
+            .current_branch(dir.path())
+            .expect("current_branch")
+            .expect("not detached");
+        (dir, service, branch)
+    }
+
+    #[test]
+    fn add_worktree_creates_branch_and_checkout() {
+        let (repo_dir, service, base_branch) = init_test_repo();
+        let worktree_path = repo_dir.path().join(".forge-workspace/worktrees/run1");
+
+        service
+            .add_worktree(repo_dir.path(), &worktree_path, "forge/agent/test/run1", &base_branch)
+            .expect("add_worktree should succeed");
+
+        assert!(worktree_path.join("README.md").exists());
+
+        let worktrees = service.list_worktrees(repo_dir.path()).expect("list_worktrees");
+        assert_eq!(worktrees.len(), 2, "primary + one agent worktree");
+        assert!(worktrees
+            .iter()
+            .any(|w| w.branch.as_deref() == Some("forge/agent/test/run1")));
+    }
+
+    #[test]
+    fn add_worktree_fails_with_real_git_error_on_duplicate_branch() {
+        let (repo_dir, service, base_branch) = init_test_repo();
+        let worktree_path = repo_dir.path().join(".forge-workspace/worktrees/run1");
+        service
+            .add_worktree(repo_dir.path(), &worktree_path, "forge/agent/test/run1", &base_branch)
+            .expect("first add_worktree should succeed");
+
+        let second_path = repo_dir.path().join(".forge-workspace/worktrees/run2");
+        let err = service
+            .add_worktree(repo_dir.path(), &second_path, "forge/agent/test/run1", &base_branch)
+            .expect_err("duplicate branch name should fail");
+        // Real git stderr, not a generic message — should mention the branch.
+        assert!(err.to_string().contains("forge/agent/test/run1"));
+    }
+
+    #[test]
+    fn remove_worktree_removes_clean_worktree() {
+        let (repo_dir, service, base_branch) = init_test_repo();
+        let worktree_path = repo_dir.path().join(".forge-workspace/worktrees/run1");
+        service
+            .add_worktree(repo_dir.path(), &worktree_path, "forge/agent/test/run1", &base_branch)
+            .expect("add_worktree");
+
+        service
+            .remove_worktree(repo_dir.path(), &worktree_path)
+            .expect("remove_worktree should succeed on a clean worktree");
+
+        let worktrees = service.list_worktrees(repo_dir.path()).expect("list_worktrees");
+        assert_eq!(worktrees.len(), 1, "only the primary worktree remains");
+    }
+
+    #[test]
+    fn remove_worktree_refuses_dirty_worktree_without_force() {
+        let (repo_dir, service, base_branch) = init_test_repo();
+        let worktree_path = repo_dir.path().join(".forge-workspace/worktrees/run1");
+        service
+            .add_worktree(repo_dir.path(), &worktree_path, "forge/agent/test/run1", &base_branch)
+            .expect("add_worktree");
+
+        // Uncommitted change inside the worktree.
+        std::fs::write(worktree_path.join("README.md"), "changed\n").expect("write");
+
+        let result = service.remove_worktree(repo_dir.path(), &worktree_path);
+        assert!(result.is_err(), "dirty worktree removal must fail, not be force-removed");
+
+        // The worktree should still be there since removal was refused.
+        let worktrees = service.list_worktrees(repo_dir.path()).expect("list_worktrees");
+        assert_eq!(worktrees.len(), 2, "dirty worktree was not removed");
     }
 }

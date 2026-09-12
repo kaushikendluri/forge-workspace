@@ -87,6 +87,10 @@ pub fn run() {
             commands::notifications_commands::list_notifications,
             commands::notifications_commands::mark_notification_read,
             commands::notifications_commands::unread_notification_count,
+            commands::agent_commands::create_agent,
+            commands::agent_commands::list_agents,
+            commands::agent_commands::start_worktree_for_agent,
+            commands::agent_commands::remove_agent_workspace,
         ])
         .run(tauri::generate_context!())
         .expect("error while running forge-workspace");

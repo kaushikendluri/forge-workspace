@@ -2,6 +2,7 @@
 //! `lib.rs`'s `tauri::generate_handler!` once implemented. Command names
 //! here correspond 1:1 to `src/lib/tauri.ts`'s `CommandMap` keys.
 
+pub mod agent_commands;
 pub mod fs_commands;
 pub mod git_commands;
 pub mod notifications_commands;

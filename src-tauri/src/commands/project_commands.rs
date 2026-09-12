@@ -8,7 +8,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 
 use crate::commands::run_blocking;
-use crate::db::models::{Agent, Project, Repository, Task};
+use crate::db::models::{Project, Repository, Task};
 use crate::db::repository::{projects as projects_repo, repositories as repositories_repo};
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
@@ -172,11 +172,6 @@ pub fn create_project(
     _description: Option<String>,
 ) -> AppResult<Project> {
     todo!("M2+: a project with no repository yet — not needed until multi-repo projects land")
-}
-
-#[tauri::command]
-pub fn list_agents(_state: State<AppState>, _project_id: String) -> AppResult<Vec<Agent>> {
-    todo!("M5: agents land with the agent-run execution milestone")
 }
 
 #[tauri::command]

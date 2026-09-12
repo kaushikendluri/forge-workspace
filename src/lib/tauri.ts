@@ -50,6 +50,9 @@ export interface CommandMap {
   list_workspaces: { args: { repositoryId: string }; result: Workspace[] };
   list_tasks: { args: { projectId: string }; result: Task[] };
   list_agents: { args: { projectId: string }; result: Agent[] };
+  create_agent: { args: { projectId: string; name: string }; result: Agent };
+  start_worktree_for_agent: { args: { agentId: string; taskPrompt: string }; result: Workspace };
+  remove_agent_workspace: { args: { workspaceId: string }; result: void };
   get_setting: { args: { key: string }; result: string | null };
   set_setting: { args: { key: string; value: string }; result: void };
   list_settings: { args: Record<string, never>; result: Record<string, string> };
@@ -198,4 +201,28 @@ export async function markNotificationRead(id: string): Promise<void> {
 /** Count of unread notifications for `projectId` (or every project, if `null`). */
 export async function unreadNotificationCount(projectId: string | null): Promise<number> {
   return invokeCommand("unread_notification_count", { projectId });
+}
+
+/** All agents for `projectId`, most recently created first. */
+export async function listAgents(projectId: string): Promise<Agent[]> {
+  return invokeCommand("list_agents", { projectId });
+}
+
+/** Creates a new agent (status `idle`) for `projectId`'s repository. */
+export async function createAgent(projectId: string, name: string): Promise<Agent> {
+  return invokeCommand("create_agent", { projectId, name });
+}
+
+/**
+ * The M5-scoped "Start" action: creates a real git worktree + branch for
+ * `agentId` and records a queued run for `taskPrompt`. No model call is
+ * made — agent execution lands in a later milestone.
+ */
+export async function startWorktreeForAgent(agentId: string, taskPrompt: string): Promise<Workspace> {
+  return invokeCommand("start_worktree_for_agent", { agentId, taskPrompt });
+}
+
+/** Removes the worktree backing `workspaceId` and marks it removed. Fails if the worktree has uncommitted changes. */
+export async function removeAgentWorkspace(workspaceId: string): Promise<void> {
+  return invokeCommand("remove_agent_workspace", { workspaceId });
 }
