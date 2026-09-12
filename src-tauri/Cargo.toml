@@ -32,8 +32,10 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 
-# OS keychain access for API keys (M4)
-keyring = "3"
+# OS keychain access for API keys (M4). Native backends are opt-in features
+# per platform; only the two CI/target platforms are enabled (no Linux
+# desktop target yet).
+keyring = { version = "3", features = ["apple-native", "windows-native"] }
 
 # Cross-platform PTY for the Terminal tab (M3)
 portable-pty = "0.8"

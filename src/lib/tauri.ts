@@ -17,15 +17,16 @@ import type {
   FilePreviewDto,
   GitFileDiff,
   GitStatus,
+  ModelConfig,
+  Notification,
   Project,
   ProjectDto,
   Repository,
-  Setting,
   Task,
   Workspace,
 } from "@/types/db";
 
-// TODO(M3+): fill in remaining request/response types (settings, workspaces,
+// TODO(M5+): fill in remaining request/response types (workspaces,
 // agents/tasks) as each command lands; keep it centralized so `invokeCommand`
 // stays the only place that calls `@tauri-apps/api`'s `invoke`.
 export interface CommandMap {
@@ -49,8 +50,16 @@ export interface CommandMap {
   list_workspaces: { args: { repositoryId: string }; result: Workspace[] };
   list_tasks: { args: { projectId: string }; result: Task[] };
   list_agents: { args: { projectId: string }; result: Agent[] };
-  get_setting: { args: { key: string }; result: Setting | null };
+  get_setting: { args: { key: string }; result: string | null };
   set_setting: { args: { key: string; value: string }; result: void };
+  list_settings: { args: Record<string, never>; result: Record<string, string> };
+  set_api_key: { args: { key: string }; result: void };
+  has_api_key: { args: Record<string, never>; result: boolean };
+  clear_api_key: { args: Record<string, never>; result: void };
+  list_model_configs: { args: Record<string, never>; result: ModelConfig[] };
+  list_notifications: { args: { projectId: string | null }; result: Notification[] };
+  mark_notification_read: { args: { id: string }; result: void };
+  unread_notification_count: { args: { projectId: string | null }; result: number };
 }
 
 /**
@@ -139,4 +148,54 @@ export async function terminalResize(terminalId: string, cols: number, rows: num
 /** Kills the terminal session's child process. */
 export async function terminalKill(terminalId: string): Promise<void> {
   return invokeCommand("terminal_kill", { terminalId });
+}
+
+/** The stored value for `key`, or `null` if it's never been set. */
+export async function getSetting(key: string): Promise<string | null> {
+  return invokeCommand("get_setting", { key });
+}
+
+/** Inserts or updates the value for `key`. */
+export async function setSetting(key: string, value: string): Promise<void> {
+  return invokeCommand("set_setting", { key, value });
+}
+
+/** All settings currently stored, as a flat `key -> value` map. */
+export async function listSettings(): Promise<Record<string, string>> {
+  return invokeCommand("list_settings", {});
+}
+
+/** Stores the Anthropic API key in the OS keychain (never SQLite). */
+export async function setApiKey(key: string): Promise<void> {
+  return invokeCommand("set_api_key", { key });
+}
+
+/** Whether an Anthropic API key is currently stored. Never returns the key itself. */
+export async function hasApiKey(): Promise<boolean> {
+  return invokeCommand("has_api_key", {});
+}
+
+/** Removes the stored Anthropic API key, if any. */
+export async function clearApiKey(): Promise<void> {
+  return invokeCommand("clear_api_key", {});
+}
+
+/** The known model configs (seeded with one Claude Sonnet 5 default), default first. */
+export async function listModelConfigs(): Promise<ModelConfig[]> {
+  return invokeCommand("list_model_configs", {});
+}
+
+/** Notifications for `projectId` (or every project, if `null`), most recent first. */
+export async function listNotifications(projectId: string | null): Promise<Notification[]> {
+  return invokeCommand("list_notifications", { projectId });
+}
+
+/** Marks a single notification as read. */
+export async function markNotificationRead(id: string): Promise<void> {
+  return invokeCommand("mark_notification_read", { id });
+}
+
+/** Count of unread notifications for `projectId` (or every project, if `null`). */
+export async function unreadNotificationCount(projectId: string | null): Promise<number> {
+  return invokeCommand("unread_notification_count", { projectId });
 }

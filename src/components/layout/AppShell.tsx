@@ -1,9 +1,11 @@
+import { useEffect } from "react";
 import { Outlet } from "react-router-dom";
 import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
 import { Sidebar } from "./Sidebar";
 import { TopBar } from "./TopBar";
 import { CommandPalette } from "./CommandPalette";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { useSettingsStore } from "@/stores/useSettingsStore";
 
 /**
  * Top-level app frame: collapsible sidebar + resizable content area, topped
@@ -11,6 +13,15 @@ import { TooltipProvider } from "@/components/ui/tooltip";
  * itself is owned by <Sidebar />, driven by useUIStore's sidebarCollapsed.
  */
 export function AppShell() {
+  const loadThemeFromBackend = useSettingsStore((s) => s.loadThemeFromBackend);
+
+  // Reconcile the instant, localStorage-sourced theme with the backend's
+  // `ui.theme` setting once, at app startup — the backend wins if it
+  // disagrees (SQLite is the real state).
+  useEffect(() => {
+    void loadThemeFromBackend();
+  }, [loadThemeFromBackend]);
+
   return (
     <TooltipProvider delayDuration={300}>
       <div className="flex h-screen w-screen overflow-hidden bg-background text-foreground">

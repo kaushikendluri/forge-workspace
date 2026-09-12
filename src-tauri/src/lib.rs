@@ -77,6 +77,16 @@ pub fn run() {
             commands::terminal_commands::terminal_write,
             commands::terminal_commands::terminal_resize,
             commands::terminal_commands::terminal_kill,
+            commands::settings_commands::get_setting,
+            commands::settings_commands::set_setting,
+            commands::settings_commands::list_settings,
+            commands::settings_commands::set_api_key,
+            commands::settings_commands::has_api_key,
+            commands::settings_commands::clear_api_key,
+            commands::settings_commands::list_model_configs,
+            commands::notifications_commands::list_notifications,
+            commands::notifications_commands::mark_notification_read,
+            commands::notifications_commands::unread_notification_count,
         ])
         .run(tauri::generate_context!())
         .expect("error while running forge-workspace");

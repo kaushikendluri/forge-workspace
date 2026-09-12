@@ -1,9 +1,13 @@
-import type { ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { Moon, Sun } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useSettingsStore, type Theme } from "@/stores/useSettingsStore";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Separator } from "@/components/ui/separator";
+import { isTauriRuntime, listModelConfigs } from "@/lib/tauri";
+import type { ModelConfig } from "@/types/db";
 
 function SettingsSection({
   title,
@@ -25,19 +29,142 @@ function SettingsSection({
   );
 }
 
-function BackendRequiredNotice({ milestone }: { milestone: string }) {
-  return (
-    <div className="flex items-center gap-2 rounded-md border border-dashed border-border bg-surface px-3 py-2.5 text-sm text-muted-foreground">
-      <Badge variant="outline">Requires backend</Badge>
-      <span>Coming in {milestone}</span>
-    </div>
-  );
-}
-
 const themeOptions: { value: Theme; label: string; icon: typeof Sun }[] = [
   { value: "dark", label: "Dark", icon: Moon },
   { value: "light", label: "Light", icon: Sun },
 ];
+
+/**
+ * API key input + Save/Clear, wired to the real `set_api_key`/`has_api_key`/
+ * `clear_api_key` commands (OS keychain-backed). The stored key's plaintext
+ * value is never re-read into the UI — only whether one is configured.
+ */
+function ApiKeySection() {
+  const hasKey = useSettingsStore((s) => s.hasApiKey);
+  const isChecking = useSettingsStore((s) => s.isCheckingApiKey);
+  const apiKeyError = useSettingsStore((s) => s.apiKeyError);
+  const checkApiKey = useSettingsStore((s) => s.checkApiKey);
+  const setApiKey = useSettingsStore((s) => s.setApiKey);
+  const clearApiKey = useSettingsStore((s) => s.clearApiKey);
+
+  const [input, setInput] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    void checkApiKey();
+  }, [checkApiKey]);
+
+  const handleSave = async () => {
+    setSaving(true);
+    const ok = await setApiKey(input);
+    setSaving(false);
+    if (ok) setInput("");
+  };
+
+  const handleClear = async () => {
+    setSaving(true);
+    await clearApiKey();
+    setSaving(false);
+  };
+
+  if (!isTauriRuntime()) {
+    return (
+      <p className="text-xs text-muted-foreground">
+        API key storage requires the desktop app runtime.
+      </p>
+    );
+  }
+
+  if (isChecking) {
+    return <p className="text-xs text-muted-foreground">Checking keychain…</p>;
+  }
+
+  if (hasKey) {
+    return (
+      <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-surface px-3 py-2.5">
+        <div className="flex items-center gap-2">
+          <Badge variant="success">Key configured</Badge>
+          <span className="text-xs text-muted-foreground">
+            Anthropic API key stored in the OS keychain.
+          </span>
+        </div>
+        <Button variant="outline" size="sm" onClick={() => void handleClear()} disabled={saving}>
+          Clear
+        </Button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex gap-2">
+        <Input
+          type="password"
+          placeholder="sk-ant-..."
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          autoComplete="off"
+          className="max-w-xs"
+        />
+        <Button onClick={() => void handleSave()} disabled={saving || input.trim().length === 0}>
+          Save
+        </Button>
+      </div>
+      <p className="text-xs text-muted-foreground">
+        No key set. Stored in the OS keychain — never in the database.
+      </p>
+      {apiKeyError && <p className="text-xs text-destructive">{apiKeyError}</p>}
+    </div>
+  );
+}
+
+/**
+ * Read-only list of the known model configs (seeded with one Claude Sonnet 5
+ * default by the M1 migration). Editing/adding models is a later milestone.
+ */
+function ModelConfigSection() {
+  const [models, setModels] = useState<ModelConfig[] | null>(null);
+
+  useEffect(() => {
+    if (!isTauriRuntime()) {
+      setModels([]);
+      return;
+    }
+    listModelConfigs()
+      .then(setModels)
+      .catch(() => setModels([]));
+  }, []);
+
+  if (models === null) {
+    return <p className="text-xs text-muted-foreground">Loading…</p>;
+  }
+
+  if (models.length === 0) {
+    return <p className="text-xs text-muted-foreground">No model configs found.</p>;
+  }
+
+  return (
+    <div className="flex flex-col gap-2">
+      {models.map((model) => (
+        <div
+          key={model.id}
+          className="flex items-center justify-between rounded-md border border-border bg-surface px-3 py-2.5"
+        >
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-medium text-foreground">{model.displayName}</span>
+            {model.isDefault && <Badge variant="outline">Default</Badge>}
+          </div>
+          <span className="text-xs text-muted-foreground">
+            {model.modelId} · max {model.maxOutputTokens.toLocaleString()} output tokens
+          </span>
+        </div>
+      ))}
+      <p className="text-xs text-muted-foreground">
+        Adding or editing models lands in a later milestone.
+      </p>
+    </div>
+  );
+}
 
 export function Settings() {
   const theme = useSettingsStore((s) => s.theme);
@@ -75,7 +202,7 @@ export function Settings() {
         title="API Keys"
         description="Store provider API keys securely via the OS keychain."
       >
-        <BackendRequiredNotice milestone="M4" />
+        <ApiKeySection />
       </SettingsSection>
 
       <Separator />
@@ -84,7 +211,7 @@ export function Settings() {
         title="Model Configuration"
         description="Choose default models and output limits for agent runs."
       >
-        <BackendRequiredNotice milestone="M4" />
+        <ModelConfigSection />
       </SettingsSection>
     </div>
   );
