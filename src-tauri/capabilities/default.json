@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Capabilities available to the main window in Forge Workspace.",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "dialog:allow-open"]
 }

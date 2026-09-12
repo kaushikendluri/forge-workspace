@@ -31,6 +31,43 @@ export interface Repository {
   createdAt: IsoDateTime;
 }
 
+/**
+ * A project row joined with its (Phase 1: single) repository — the shape
+ * returned by the `open_project`/`init_project`/`list_projects` Tauri
+ * commands and rendered by the Dashboard/Projects routes. Mirrors
+ * `src-tauri/src/commands/project_commands.rs`'s `ProjectDto`.
+ */
+export interface ProjectDto extends Project {
+  repositoryId: string;
+  rootPath: string;
+  remoteUrl: string | null;
+  defaultBranch: string;
+  vcsType: VcsType;
+}
+
+/** One tracked file's status on one side (index or worktree) of a change. */
+export interface FileStatusEntry {
+  path: string;
+  statusCode: string;
+}
+
+/**
+ * Working-tree status for a repository, from `git status --porcelain=v2`.
+ * Mirrors `src-tauri/src/git/mod.rs`'s `GitStatus`.
+ */
+export interface GitStatus {
+  currentBranch: string | null;
+  staged: FileStatusEntry[];
+  unstaged: FileStatusEntry[];
+  untracked: string[];
+}
+
+/** Mirrors `src-tauri/src/git/mod.rs`'s `BranchInfo`. */
+export interface BranchInfo {
+  name: string;
+  isCurrent: boolean;
+}
+
 export type AgentStatus = "idle" | "running" | "completed" | "failed" | "stopped";
 
 export interface Agent {

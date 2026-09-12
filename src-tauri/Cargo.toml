@@ -20,6 +20,10 @@ tokio = { version = "1", features = ["full"] }
 rusqlite = { version = "0.32", features = ["bundled", "chrono", "uuid"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.25"
+rusqlite_migration = "1"
+
+# Native folder picker for "Open an existing repository" / "Create a new project"
+tauri-plugin-dialog = "2"
 
 # HTTP client (Anthropic API calls, later milestones)
 reqwest = { version = "0.12", features = ["json", "stream"] }

@@ -13,6 +13,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 export function TopBar() {
   const activeProjectId = useProjectStore((s) => s.activeProjectId);
   const projects = useProjectStore((s) => s.projects);
+  const activeBranch = useProjectStore((s) => s.activeBranch);
   const theme = useSettingsStore((s) => s.theme);
   const toggleTheme = useSettingsStore((s) => s.toggleTheme);
   const toggleCommandPalette = useUIStore((s) => s.toggleCommandPalette);
@@ -26,10 +27,12 @@ export function TopBar() {
         <span className="truncate text-sm font-medium text-foreground">
           {activeProject ? activeProject.name : "No project open"}
         </span>
-        <span className="flex items-center gap-1 text-xs text-subtle-foreground">
-          <GitBranch className="h-3.5 w-3.5" />
-          {activeProject ? "—" : "—"}
-        </span>
+        {activeProject && (
+          <span className="flex items-center gap-1 text-xs text-subtle-foreground">
+            <GitBranch className="h-3.5 w-3.5" />
+            {activeBranch ?? activeProject.defaultBranch}
+          </span>
+        )}
       </div>
 
       <div className="flex items-center gap-1.5">

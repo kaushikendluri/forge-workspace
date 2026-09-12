@@ -26,6 +26,7 @@ use std::path::PathBuf;
 
 use tauri::Manager;
 
+use git::GitCliService;
 use state::AppState;
 
 /// Resolves where the SQLite database file lives, inside Tauri's per-app
@@ -42,6 +43,7 @@ fn resolve_db_path(app: &tauri::AppHandle) -> PathBuf {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let db_path = resolve_db_path(&app.handle());
             if let Some(parent) = db_path.parent() {
@@ -50,19 +52,24 @@ pub fn run() {
 
             let pool = db::create_pool(&db_path)?;
             {
-                let conn = pool.get()?;
-                db::migrations::run_migrations(&conn)?;
+                let mut conn = pool.get()?;
+                db::migrations::run_migrations(&mut conn)?;
             }
 
-            app.manage(AppState::new(pool));
+            let os_adapter = os_adapter::current();
+            let git_service: Box<dyn git::GitService> = Box::new(GitCliService::new(os_adapter.as_ref()));
+
+            app.manage(AppState::new(pool, os_adapter, git_service));
             Ok(())
         })
-        // TODO(M2+): register commands as they're implemented, e.g.:
-        // .invoke_handler(tauri::generate_handler![
-        //     commands::project_commands::list_projects,
-        //     commands::project_commands::get_project,
-        //     ...
-        // ])
+        .invoke_handler(tauri::generate_handler![
+            commands::project_commands::open_project,
+            commands::project_commands::init_project,
+            commands::project_commands::list_projects,
+            commands::git_commands::git_status,
+            commands::git_commands::git_branches,
+            commands::git_commands::git_current_branch,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running forge-workspace");
 }

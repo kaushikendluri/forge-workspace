@@ -8,7 +8,14 @@ pub struct WindowsAdapter;
 
 impl OperatingSystemAdapter for WindowsAdapter {
     fn default_shell(&self) -> String {
-        env::var("COMSPEC").unwrap_or_else(|_| "powershell.exe".to_string())
+        // Prefer PowerShell 7+ (`pwsh.exe`) when it's on PATH, falling back to
+        // Windows PowerShell (`powershell.exe`), which ships on every Windows
+        // install.
+        if self.resolve_executable("pwsh").is_some() {
+            "pwsh.exe".to_string()
+        } else {
+            "powershell.exe".to_string()
+        }
     }
 
     fn shell_invocation(&self) -> Vec<String> {

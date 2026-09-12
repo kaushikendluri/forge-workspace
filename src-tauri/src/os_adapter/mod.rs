@@ -9,8 +9,10 @@ use std::path::PathBuf;
 pub mod macos;
 pub mod windows;
 
-/// Per-OS behavior needed by the terminal (M3) and git (M3+) layers.
-pub trait OperatingSystemAdapter {
+/// Per-OS behavior needed by the terminal (M3) and git (M2+) layers. `Send +
+/// Sync` so a `Box<dyn OperatingSystemAdapter>` can live in `AppState`,
+/// which Tauri requires to be `Send + Sync + 'static` to `.manage()` it.
+pub trait OperatingSystemAdapter: Send + Sync {
     /// The shell to launch when the user opens a Terminal tab with no
     /// project-specific override (e.g. `powershell.exe` on Windows, `zsh`
     /// on macOS).

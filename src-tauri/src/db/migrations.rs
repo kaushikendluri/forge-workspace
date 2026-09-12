@@ -1,40 +1,23 @@
-//! Applies SQL migrations from `../migrations/*.sql` in order, tracked in a
-//! `schema_migrations` bookkeeping table so re-running the app doesn't
-//! re-apply migrations that already ran.
+//! Applies SQL migrations from `../../migrations/*.sql`, embedded at compile
+//! time via `include_str!`, using `rusqlite_migration`. It tracks the
+//! applied schema version in its own bookkeeping table (`_rusqlite_migration_version`)
+//! so re-running the app doesn't re-apply migrations that already ran.
 
 use rusqlite::Connection;
+use rusqlite_migration::{Migrations, M};
 
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 
-/// (filename, embedded SQL) pairs, in application order. `include_str!` is
-/// resolved at compile time relative to this file.
-const MIGRATIONS: &[(&str, &str)] = &[("0001_init.sql", include_str!("../../migrations/0001_init.sql"))];
+/// Migrations in application order. `include_str!` is resolved at compile
+/// time relative to this file, so the embedded SQL is baked into the binary
+/// — no runtime dependency on the `migrations/` directory existing.
+fn migrations() -> Migrations<'static> {
+    Migrations::new(vec![M::up(include_str!("../../migrations/0001_init.sql"))])
+}
 
-pub fn run_migrations(conn: &Connection) -> AppResult<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS schema_migrations (
-            name TEXT PRIMARY KEY,
-            applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-        );",
-    )?;
-
-    for (name, sql) in MIGRATIONS {
-        let already_applied: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE name = ?1)",
-            [name],
-            |row| row.get(0),
-        )?;
-
-        if already_applied {
-            continue;
-        }
-
-        conn.execute_batch(sql)?;
-        conn.execute(
-            "INSERT INTO schema_migrations (name) VALUES (?1)",
-            [name],
-        )?;
-    }
-
-    Ok(())
+/// Brings `conn`'s schema up to the latest migration.
+pub fn run_migrations(conn: &mut Connection) -> AppResult<()> {
+    migrations()
+        .to_latest(conn)
+        .map_err(|e| AppError::Other(format!("migration failed: {e}")))
 }
