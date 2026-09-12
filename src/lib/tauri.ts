@@ -12,6 +12,10 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   Agent,
   BranchInfo,
+  CommitInfo,
+  DirEntryDto,
+  FilePreviewDto,
+  GitFileDiff,
   GitStatus,
   Project,
   ProjectDto,
@@ -33,6 +37,14 @@ export interface CommandMap {
   git_status: { args: { repoPath: string }; result: GitStatus };
   git_branches: { args: { repoPath: string }; result: BranchInfo[] };
   git_current_branch: { args: { repoPath: string }; result: string | null };
+  git_diff_file: { args: { repoPath: string; filePath: string }; result: GitFileDiff };
+  git_log: { args: { repoPath: string; limit: number }; result: CommitInfo[] };
+  list_directory: { args: { dirPath: string }; result: DirEntryDto[] };
+  read_file_preview: { args: { filePath: string; maxBytes: number }; result: FilePreviewDto };
+  terminal_spawn: { args: { cwd: string }; result: string };
+  terminal_write: { args: { terminalId: string; data: string }; result: void };
+  terminal_resize: { args: { terminalId: string; cols: number; rows: number }; result: void };
+  terminal_kill: { args: { terminalId: string }; result: void };
   open_repository: { args: { rootPath: string }; result: Repository };
   list_workspaces: { args: { repositoryId: string }; result: Workspace[] };
   list_tasks: { args: { projectId: string }; result: Task[] };
@@ -84,4 +96,47 @@ export async function gitBranches(repoPath: string): Promise<BranchInfo[]> {
 /** The currently checked-out branch, or `null` if HEAD is detached. */
 export async function gitCurrentBranch(repoPath: string): Promise<string | null> {
   return invokeCommand("git_current_branch", { repoPath });
+}
+
+/**
+ * Full before/after text for `filePath` (relative to `repoPath`), for the
+ * Changes tab's diff viewer. Handles new/deleted files rather than erroring.
+ */
+export async function gitDiffFile(repoPath: string, filePath: string): Promise<GitFileDiff> {
+  return invokeCommand("git_diff_file", { repoPath, filePath });
+}
+
+/** The `limit` most recent commits for the repository at `repoPath`. */
+export async function gitLog(repoPath: string, limit: number): Promise<CommitInfo[]> {
+  return invokeCommand("git_log", { repoPath, limit });
+}
+
+/** Lists the contents of `dirPath` (directories first, then alphabetical). */
+export async function listDirectory(dirPath: string): Promise<DirEntryDto[]> {
+  return invokeCommand("list_directory", { dirPath });
+}
+
+/** Reads up to `maxBytes` of `filePath`, reporting truncation/binary-ness. */
+export async function readFilePreview(filePath: string, maxBytes: number): Promise<FilePreviewDto> {
+  return invokeCommand("read_file_preview", { filePath, maxBytes });
+}
+
+/** Spawns a new PTY-backed shell session rooted at `cwd`; returns its id. */
+export async function terminalSpawn(cwd: string): Promise<string> {
+  return invokeCommand("terminal_spawn", { cwd });
+}
+
+/** Writes raw keystrokes to the terminal session's pty stdin. */
+export async function terminalWrite(terminalId: string, data: string): Promise<void> {
+  return invokeCommand("terminal_write", { terminalId, data });
+}
+
+/** Resizes the terminal session's pty to match the frontend's dimensions. */
+export async function terminalResize(terminalId: string, cols: number, rows: number): Promise<void> {
+  return invokeCommand("terminal_resize", { terminalId, cols, rows });
+}
+
+/** Kills the terminal session's child process. */
+export async function terminalKill(terminalId: string): Promise<void> {
+  return invokeCommand("terminal_kill", { terminalId });
 }

@@ -69,6 +69,14 @@ pub fn run() {
             commands::git_commands::git_status,
             commands::git_commands::git_branches,
             commands::git_commands::git_current_branch,
+            commands::git_commands::git_diff_file,
+            commands::git_commands::git_log,
+            commands::fs_commands::list_directory,
+            commands::fs_commands::read_file_preview,
+            commands::terminal_commands::terminal_spawn,
+            commands::terminal_commands::terminal_write,
+            commands::terminal_commands::terminal_resize,
+            commands::terminal_commands::terminal_kill,
         ])
         .run(tauri::generate_context!())
         .expect("error while running forge-workspace");

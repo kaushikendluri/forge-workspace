@@ -38,6 +38,10 @@ keyring = "3"
 # Cross-platform PTY for the Terminal tab (M3)
 portable-pty = "0.8"
 
+# Encodes raw PTY output bytes for the `terminal:output` event payload (PTY
+# output isn't guaranteed to be valid UTF-8 on its own).
+base64 = "0.22"
+
 # Error handling
 thiserror = "2"
 anyhow = "1"

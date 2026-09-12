@@ -1,29 +1,51 @@
 //! Commands backing `src/components/terminal/TerminalView.tsx` /
 //! `src/stores/useTerminalStore.ts`. Output is pushed the other direction
-//! via the `terminal:output` event (see `events/mod.rs`), not returned
-//! from these commands.
+//! via the `terminal:output` / `terminal:exit` events (see `events/mod.rs`
+//! and `terminal/mod.rs`), not returned from these commands.
 
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager};
 
-use crate::error::AppResult;
+use crate::commands::run_blocking;
 use crate::state::AppState;
 
+/// Spawns a new PTY-backed shell session rooted at `cwd` and returns its id.
 #[tauri::command]
-pub fn open_terminal(_app: AppHandle, _state: State<AppState>, _project_id: String, _cwd: String) -> AppResult<String> {
-    todo!("M3: terminal::spawn_session, return the new session id")
+pub async fn terminal_spawn(app: AppHandle, cwd: String) -> Result<String, String> {
+    run_blocking(move || {
+        let state = app.state::<AppState>();
+        state.terminals.spawn(&app, state.os_adapter.as_ref(), &cwd)
+    })
+    .await
 }
 
+/// Writes `data` (raw keystrokes from the frontend's xterm.js instance) to
+/// the session's pty stdin.
 #[tauri::command]
-pub fn write_terminal(_state: State<AppState>, _session_id: String, _data: String) -> AppResult<()> {
-    todo!("M3: terminal::write_to_session")
+pub async fn terminal_write(app: AppHandle, terminal_id: String, data: String) -> Result<(), String> {
+    run_blocking(move || {
+        let state = app.state::<AppState>();
+        state.terminals.write(&terminal_id, data.as_bytes())
+    })
+    .await
 }
 
+/// Resizes the session's pty to match the frontend terminal's new
+/// dimensions.
 #[tauri::command]
-pub fn resize_terminal(_state: State<AppState>, _session_id: String, _cols: u16, _rows: u16) -> AppResult<()> {
-    todo!("M3: terminal::resize_session")
+pub async fn terminal_resize(app: AppHandle, terminal_id: String, cols: u16, rows: u16) -> Result<(), String> {
+    run_blocking(move || {
+        let state = app.state::<AppState>();
+        state.terminals.resize(&terminal_id, cols, rows)
+    })
+    .await
 }
 
+/// Kills the session's child process and drops its pty handles.
 #[tauri::command]
-pub fn close_terminal(_state: State<AppState>, _session_id: String) -> AppResult<()> {
-    todo!("M3: terminal::kill_session")
+pub async fn terminal_kill(app: AppHandle, terminal_id: String) -> Result<(), String> {
+    run_blocking(move || {
+        let state = app.state::<AppState>();
+        state.terminals.kill(&terminal_id)
+    })
+    .await
 }

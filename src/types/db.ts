@@ -68,6 +68,50 @@ export interface BranchInfo {
   isCurrent: boolean;
 }
 
+/**
+ * Full before/after file text for the Changes tab's diff viewer. Mirrors
+ * `src-tauri/src/git/mod.rs`'s `GitFileDiff` — `original`/`modified` are
+ * `""` for a new/deleted file respectively, rather than the command
+ * erroring.
+ */
+export interface GitFileDiff {
+  original: string;
+  modified: string;
+  isNewFile: boolean;
+  isDeleted: boolean;
+}
+
+/** One `git log` entry. Mirrors `src-tauri/src/git/mod.rs`'s `CommitInfo`. */
+export interface CommitInfo {
+  sha: string;
+  shortSha: string;
+  author: string;
+  email: string;
+  /** ISO 8601 author date. */
+  date: string;
+  subject: string;
+}
+
+/** One directory entry. Mirrors `src-tauri/src/commands/fs_commands.rs`'s `DirEntryDto`. */
+export interface DirEntryDto {
+  name: string;
+  path: string;
+  isDir: boolean;
+  /** `null` for directories. */
+  sizeBytes: number | null;
+}
+
+/**
+ * A (possibly truncated) file preview. Mirrors
+ * `src-tauri/src/commands/fs_commands.rs`'s `FilePreviewDto`.
+ */
+export interface FilePreviewDto {
+  /** Empty when `isBinary` is true. */
+  content: string;
+  truncated: boolean;
+  isBinary: boolean;
+}
+
 export type AgentStatus = "idle" | "running" | "completed" | "failed" | "stopped";
 
 export interface Agent {

@@ -19,8 +19,7 @@ impl OperatingSystemAdapter for WindowsAdapter {
     }
 
     fn shell_invocation(&self) -> Vec<String> {
-        // TODO(M3): detect and prefer pwsh.exe (PowerShell 7+) when installed.
-        vec!["powershell.exe".to_string(), "-NoLogo".to_string()]
+        vec![self.default_shell(), "-NoLogo".to_string()]
     }
 
     fn resolve_executable(&self, name: &str) -> Option<PathBuf> {

@@ -1,6 +1,7 @@
-//! Git operations: repository discovery and status/branch inspection for
-//! the Projects and Changes tabs (worktree management for agent isolation
-//! and diff generation land in M3). Shells out to the system `git` binary
+//! Git operations: repository discovery, status/branch inspection, and
+//! diff/log for the Projects and Changes tabs (worktree management for
+//! agent isolation still lands later, alongside agent execution). Shells
+//! out to the system `git` binary
 //! (resolved via `os_adapter::OperatingSystemAdapter::resolve_executable`)
 //! rather than linking libgit2, to stay compatible with the user's own git
 //! config/credentials/hooks.
@@ -46,11 +47,34 @@ pub struct BranchInfo {
     pub is_current: bool,
 }
 
-#[derive(Debug, Clone)]
-pub struct GitDiff {
-    pub path: String,
+/// Full before/after file text for the Changes tab's Monaco diff viewer.
+/// Built from `git show HEAD:<path>` (original) + the working-tree file
+/// (modified) rather than a parsed unified patch — simpler, and Monaco wants
+/// full-file text on both sides anyway.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitFileDiff {
+    /// The file's content at `HEAD`, or `""` if it has no committed version
+    /// (i.e. it's untracked/newly added).
     pub original: String,
+    /// The file's current working-tree content, or `""` if it no longer
+    /// exists there (i.e. it was deleted).
     pub modified: String,
+    pub is_new_file: bool,
+    pub is_deleted: bool,
+}
+
+/// One entry from `git log`, for the Changes tab's history view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitInfo {
+    pub sha: String,
+    pub short_sha: String,
+    pub author: String,
+    pub email: String,
+    /// ISO 8601 author date (`%aI`).
+    pub date: String,
+    pub subject: String,
 }
 
 /// Git operations needed by `commands::project_commands` and
@@ -93,11 +117,15 @@ pub trait GitService: Send + Sync {
         todo!("M3: git worktree remove <worktree_path>")
     }
 
-    /// Diff for a single file between two refs (or working tree vs. HEAD).
-    /// Default body panics — implemented alongside the diff viewer.
-    fn diff_file(&self, _repo_root: &Path, _path: &str, _base_ref: &str) -> AppResult<GitDiff> {
-        todo!("M2/M3: git show <base_ref>:<path> + read working tree file")
-    }
+    /// Full before/after text for `path`, for the Changes tab's diff viewer.
+    /// Handles new files (no `HEAD` version) and deleted files (no
+    /// working-tree version) rather than erroring on either.
+    fn diff_file(&self, repo_root: &Path, path: &str) -> AppResult<GitFileDiff>;
+
+    /// The `limit` most recent commits reachable from `HEAD`, most recent
+    /// first. Returns an empty list (rather than erroring) for a repository
+    /// with no commits yet.
+    fn log(&self, repo_root: &Path, limit: u32) -> AppResult<Vec<CommitInfo>>;
 }
 
 /// `GitService` backed by shelling out to the system `git` binary.
@@ -142,6 +170,23 @@ impl GitCliService {
         }
 
         Ok(output.stdout)
+    }
+
+    /// Like `run`, but returns `None` instead of an `Err` on a non-zero
+    /// exit — used where a failing git command is an expected, meaningful
+    /// outcome (e.g. `git show HEAD:<path>` for a file that doesn't exist at
+    /// `HEAD`) rather than a real error to surface.
+    fn try_run(&self, repo_path: &Path, args: &[&str]) -> Option<Vec<u8>> {
+        let output = Command::new(&self.git_path)
+            .args(args)
+            .current_dir(repo_path)
+            .output()
+            .ok()?;
+        if output.status.success() {
+            Some(output.stdout)
+        } else {
+            None
+        }
     }
 }
 
@@ -191,6 +236,78 @@ impl GitService for GitCliService {
 
     fn init(&self, path: &Path) -> AppResult<()> {
         self.run(path, &["init"]).map(|_| ())
+    }
+
+    fn diff_file(&self, repo_root: &Path, path: &str) -> AppResult<GitFileDiff> {
+        // `git show HEAD:<path>` fails (no `HEAD`, or the path doesn't exist
+        // at `HEAD`) for a new/untracked file — that's expected, not an
+        // error, so `try_run` rather than `run`.
+        let head_spec = format!("HEAD:{path}");
+        let original = self
+            .try_run(repo_root, &["show", head_spec.as_str()])
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+
+        // Similarly, a missing working-tree file just means the file was
+        // deleted.
+        let modified = std::fs::read(repo_root.join(path))
+            .ok()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+
+        let is_new_file = original.is_none();
+        let is_deleted = modified.is_none();
+        if is_new_file && is_deleted {
+            return Err(AppError::NotFound(format!(
+                "'{path}' exists neither at HEAD nor in the working tree"
+            )));
+        }
+
+        Ok(GitFileDiff {
+            original: original.unwrap_or_default(),
+            modified: modified.unwrap_or_default(),
+            is_new_file,
+            is_deleted,
+        })
+    }
+
+    fn log(&self, repo_root: &Path, limit: u32) -> AppResult<Vec<CommitInfo>> {
+        // Unit-separator (0x1f) between fields, record-separator (0x1e)
+        // between commits — neither can appear in git's own output, so no
+        // escaping/parsing ambiguity the way there would be with a
+        // human-oriented delimiter.
+        let format = "%H%x1f%h%x1f%an%x1f%ae%x1f%aI%x1f%s%x1e";
+        let limit_str = limit.to_string();
+        let pretty_arg = format!("--pretty=format:{format}");
+        let args: [&str; 4] = ["log", "-n", limit_str.as_str(), pretty_arg.as_str()];
+
+        // A repository with no commits yet makes `git log` fail — that's a
+        // legitimate "no history" state for a brand-new project, not an
+        // error worth surfacing, so it's reported as an empty log.
+        let Some(raw) = self.try_run(repo_root, &args) else {
+            return Ok(Vec::new());
+        };
+        let text = String::from_utf8_lossy(&raw);
+
+        let commits = text
+            .split('\u{1e}')
+            .map(str::trim)
+            .filter(|record| !record.is_empty())
+            .filter_map(|record| {
+                let fields: Vec<&str> = record.split('\u{1f}').collect();
+                if fields.len() != 6 {
+                    return None;
+                }
+                Some(CommitInfo {
+                    sha: fields[0].to_string(),
+                    short_sha: fields[1].to_string(),
+                    author: fields[2].to_string(),
+                    email: fields[3].to_string(),
+                    date: fields[4].to_string(),
+                    subject: fields[5].to_string(),
+                })
+            })
+            .collect();
+
+        Ok(commits)
     }
 }
 
