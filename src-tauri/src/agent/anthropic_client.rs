@@ -13,7 +13,6 @@
 //! isn't already a dependency of this project.
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};

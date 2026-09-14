@@ -606,7 +606,7 @@ mod tests {
         }
     }
 
-    fn test_ctx(workspace_root: PathBuf, git: &FakeGitService, os: &FakeOsAdapter) -> ToolContext<'_> {
+    fn test_ctx<'a>(workspace_root: PathBuf, git: &'a FakeGitService, os: &'a FakeOsAdapter) -> ToolContext<'a> {
         ToolContext {
             workspace_root,
             git_service: git,
