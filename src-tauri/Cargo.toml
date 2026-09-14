@@ -25,8 +25,30 @@ rusqlite_migration = "1"
 # Native folder picker for "Open an existing repository" / "Create a new project"
 tauri-plugin-dialog = "2"
 
-# HTTP client (Anthropic API calls, later milestones)
-reqwest = { version = "0.12", features = ["json", "stream"] }
+# HTTP client for the Anthropic Messages API (M6). rustls-tls (pure Rust,
+# no OpenSSL/schannel system dependency) rather than the default-tls feature
+# — `default-features = false` avoids pulling in native-tls alongside it,
+# and `AnthropicClient::new` calls `.use_rustls_tls()` explicitly so the
+# rustls backend is actually used regardless of any other crate's feature
+# unification pulling default-tls back in.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+
+# Streaming combinator (`.next()`) over `reqwest::Response::bytes_stream()`
+# in the Anthropic SSE client.
+futures-util = "0.3"
+
+# Glob (`search_files`) and basic-regex (`search_code`) matching for the
+# agent's filesystem search tools (M6).
+regex = "1"
+
+# Cooperative cancellation for a running agent loop (M6) — `stop_agent_run`
+# flips this and both the in-flight HTTP stream read and any in-flight
+# `run_command` child process are torn down promptly rather than left to run
+# to completion. Chosen over a hand-rolled `Arc<AtomicBool>` because
+# `CancellationToken::cancelled()` is itself an awaitable future, so it drops
+# straight into `tokio::select!` alongside the stream/process reads instead
+# of needing to be polled.
+tokio-util = "0.7"
 
 # Identifiers & timestamps
 uuid = { version = "1", features = ["v4", "serde"] }

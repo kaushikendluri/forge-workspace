@@ -4,6 +4,7 @@
 //! transitions a run to `running`/`completed`/etc, since the actual model
 //! call + tool loop that would do that lands in M6.
 
+use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
@@ -17,6 +18,25 @@ fn parse_status(s: &str) -> AgentRunStatus {
         "failed" => AgentRunStatus::Failed,
         "stopped" => AgentRunStatus::Stopped,
         _ => AgentRunStatus::Queued,
+    }
+}
+
+fn status_str(status: AgentRunStatus) -> &'static str {
+    match status {
+        AgentRunStatus::Queued => "queued",
+        AgentRunStatus::Running => "running",
+        AgentRunStatus::Completed => "completed",
+        AgentRunStatus::Failed => "failed",
+        AgentRunStatus::Stopped => "stopped",
+    }
+}
+
+fn stop_reason_str(reason: AgentRunStopReason) -> &'static str {
+    match reason {
+        AgentRunStopReason::Completed => "completed",
+        AgentRunStopReason::MaxIterations => "max_iterations",
+        AgentRunStopReason::UserStopped => "user_stopped",
+        AgentRunStopReason::Error => "error",
     }
 }
 
@@ -66,7 +86,6 @@ pub fn get_by_id(conn: &Connection, id: &str) -> AppResult<Option<AgentRun>> {
 /// Runs for `agent_id`, most recently started first (falling back to
 /// insertion order for runs that haven't started executing yet, since
 /// `started_at` is `NULL` until M6's execution loop stamps it).
-#[allow(dead_code)]
 pub fn list_for_agent(conn: &Connection, agent_id: &str) -> AppResult<Vec<AgentRun>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {SELECT_COLUMNS} FROM agent_runs WHERE agent_id = ?1 ORDER BY started_at DESC, rowid DESC"
@@ -111,6 +130,52 @@ pub fn set_workspace_id(conn: &Connection, id: &str, workspace_id: &str) -> AppR
     conn.execute(
         "UPDATE agent_runs SET workspace_id = ?2 WHERE id = ?1",
         params![id, workspace_id],
+    )?;
+    Ok(())
+}
+
+/// Transitions a `queued` run to `running` and stamps `started_at` — called
+/// once by `agent::tool_loop::run_agent_loop` right before the first model
+/// call, after the API key and workspace/settings lookups have all
+/// succeeded.
+pub fn mark_running(conn: &Connection, id: &str) -> AppResult<()> {
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE agent_runs SET status = 'running', started_at = ?2 WHERE id = ?1",
+        params![id, now],
+    )?;
+    Ok(())
+}
+
+/// Terminal transition for a run — `completed`/`failed`/`stopped`, with the
+/// matching `stop_reason` and (for `failed`, or a `report_completion` call
+/// with `success: false`) a human-readable `error_message`. Stamps
+/// `completed_at`. Called exactly once per run by
+/// `agent::tool_loop::finish_run`.
+pub fn mark_finished(
+    conn: &Connection,
+    id: &str,
+    status: AgentRunStatus,
+    stop_reason: Option<AgentRunStopReason>,
+    error_message: Option<&str>,
+) -> AppResult<()> {
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE agent_runs SET status = ?2, stop_reason = ?3, error_message = ?4, completed_at = ?5 WHERE id = ?1",
+        params![id, status_str(status), stop_reason.map(stop_reason_str), error_message, now],
+    )?;
+    Ok(())
+}
+
+/// Folds one model turn's token usage into the run's running totals and
+/// bumps `iteration_count` — called once per turn from the tool loop, right
+/// after a `StreamOutcome::Turn` comes back.
+pub fn record_iteration_usage(conn: &Connection, id: &str, input_tokens: i64, output_tokens: i64) -> AppResult<()> {
+    conn.execute(
+        "UPDATE agent_runs SET iteration_count = iteration_count + 1, \
+         total_input_tokens = total_input_tokens + ?2, total_output_tokens = total_output_tokens + ?3 \
+         WHERE id = ?1",
+        params![id, input_tokens, output_tokens],
     )?;
     Ok(())
 }
@@ -167,5 +232,38 @@ mod tests {
         let runs = list_for_agent(&conn, "a1").expect("list_for_agent");
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].id, run.id);
+    }
+
+    #[test]
+    fn mark_running_then_mark_finished_round_trips() {
+        let conn = setup_conn();
+        let run = insert_queued(&conn, "a1", "Fix the bug", "claude-sonnet-5").expect("insert_queued");
+
+        mark_running(&conn, &run.id).expect("mark_running");
+        let running = get_by_id(&conn, &run.id).expect("get_by_id").expect("exists");
+        assert_eq!(running.status, AgentRunStatus::Running);
+        assert!(running.started_at.is_some());
+
+        mark_finished(&conn, &run.id, AgentRunStatus::Failed, Some(AgentRunStopReason::Error), Some("boom"))
+            .expect("mark_finished");
+        let finished = get_by_id(&conn, &run.id).expect("get_by_id").expect("exists");
+        assert_eq!(finished.status, AgentRunStatus::Failed);
+        assert_eq!(finished.stop_reason, Some(AgentRunStopReason::Error));
+        assert_eq!(finished.error_message.as_deref(), Some("boom"));
+        assert!(finished.completed_at.is_some());
+    }
+
+    #[test]
+    fn record_iteration_usage_accumulates_across_calls() {
+        let conn = setup_conn();
+        let run = insert_queued(&conn, "a1", "Fix the bug", "claude-sonnet-5").expect("insert_queued");
+
+        record_iteration_usage(&conn, &run.id, 100, 20).expect("record_iteration_usage");
+        record_iteration_usage(&conn, &run.id, 50, 30).expect("record_iteration_usage");
+
+        let fetched = get_by_id(&conn, &run.id).expect("get_by_id").expect("exists");
+        assert_eq!(fetched.iteration_count, 2);
+        assert_eq!(fetched.total_input_tokens, 150);
+        assert_eq!(fetched.total_output_tokens, 50);
     }
 }

@@ -2,6 +2,7 @@
 //! entry point that calls `run()`.
 //!
 //! Module map:
+//! - `agent`    — the Anthropic tool-calling run loop (M6)
 //! - `commands` — `#[tauri::command]` functions exposed to the frontend
 //! - `db`       — SQLite pool, migrations, row models, per-table repositories
 //! - `os_adapter` — platform-specific shell/PATH/env behavior
@@ -9,9 +10,10 @@
 //! - `terminal` — PTY-backed terminal sessions
 //! - `secrets`  — OS keychain-backed API key storage
 //! - `events`   — typed event emission helpers
-//! - `state`    — shared `AppState` (db pool, terminal registry)
+//! - `state`    — shared `AppState` (db pool, terminal registry, active agent runs)
 //! - `error`    — the app-wide `AppError`/`AppResult` types
 
+pub mod agent;
 pub mod commands;
 pub mod db;
 pub mod error;
@@ -91,6 +93,13 @@ pub fn run() {
             commands::agent_commands::list_agents,
             commands::agent_commands::start_worktree_for_agent,
             commands::agent_commands::remove_agent_workspace,
+            commands::agent_run_commands::start_agent_run,
+            commands::agent_run_commands::stop_agent_run,
+            commands::agent_run_commands::get_agent_run,
+            commands::agent_run_commands::list_agent_runs,
+            commands::agent_run_commands::list_tool_calls,
+            commands::agent_run_commands::list_activity_events,
+            commands::agent_run_commands::get_run_diff,
         ])
         .run(tauri::generate_context!())
         .expect("error while running forge-workspace");

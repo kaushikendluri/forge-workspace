@@ -23,6 +23,15 @@ pub trait OperatingSystemAdapter: Send + Sync {
     /// on Windows.
     fn shell_invocation(&self) -> Vec<String>;
 
+    /// Full argv to run `command` as a single non-interactive shell command
+    /// and exit, e.g. `["zsh", "-lc", command]` on macOS or
+    /// `["powershell.exe", "-NoLogo", "-NonInteractive", "-Command",
+    /// command]` on Windows — used by the agent's `run_command` tool (M6),
+    /// which needs a one-shot invocation with a captured exit code rather
+    /// than the interactive session `shell_invocation()` hands the Terminal
+    /// tab's PTY.
+    fn one_shot_shell_invocation(&self, command: &str) -> Vec<String>;
+
     /// Resolves `name` (e.g. "git") to an absolute executable path using the
     /// platform's PATH-like search rules.
     fn resolve_executable(&self, name: &str) -> Option<PathBuf>;

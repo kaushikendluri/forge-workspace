@@ -161,6 +161,21 @@ export interface Workspace {
   removedAt: IsoDateTime | null;
 }
 
+/**
+ * One changed file in an agent run's workspace, for `AgentDetail.tsx`'s
+ * diff view. Mirrors `src-tauri/src/commands/agent_run_commands.rs`'s
+ * `AgentRunFileDiffDto` — a `GitFileDiff` (see `GitFileDiff` above) with the
+ * path that produced it attached, since a run's diff is a whole list of
+ * files rather than one selected file.
+ */
+export interface AgentRunFileDiffDto {
+  path: string;
+  original: string;
+  modified: string;
+  isNewFile: boolean;
+  isDeleted: boolean;
+}
+
 export type ToolCallStatus = "running" | "success" | "error";
 
 export interface ToolCall {

@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { Bot } from "lucide-react";
 import { EmptyState } from "@/components/empty-states/EmptyState";
 import { Button } from "@/components/ui/button";
@@ -16,13 +17,13 @@ function errorMessage(err: unknown): string {
 /**
  * Real Agents page for the active project: agents come from `list_agents`
  * (SQLite-backed), "New agent" creates a row via `create_agent`, and each
- * agent's "Start" button calls `start_worktree_for_agent` — this milestone's
- * only real capability is creating an isolated git worktree/branch for a
- * task. There is no model call or tool loop yet (that's a later milestone),
- * so the result is reported as a workspace being ready, never as the agent
- * "running" or "thinking".
+ * agent's "Start" button calls `start_worktree_for_agent` (a real git
+ * worktree + branch + queued run) and then navigates to `AgentDetail`,
+ * which is where the actual tool-calling loop is started/stopped and
+ * watched live.
  */
 export function Agents() {
+  const navigate = useNavigate();
   const activeProjectId = useProjectStore((s) => s.activeProjectId);
   const activeProject = useProjectStore((s) => s.projects.find((p) => p.id === activeProjectId));
 
@@ -79,6 +80,7 @@ export function Agents() {
   };
 
   const handleStart = async (agent: Agent) => {
+    if (!activeProjectId) return;
     const taskPrompt = window.prompt(`What should "${agent.name}" work on?`)?.trim();
     if (!taskPrompt) return;
     setStartingAgentId(agent.id);
@@ -86,6 +88,9 @@ export function Agents() {
     try {
       const workspace = await startWorktreeForAgent(agent.id, taskPrompt);
       setWorkspacesByAgentId((prev) => ({ ...prev, [agent.id]: workspace }));
+      // The queued run now exists; AgentDetail is where it's actually
+      // started (it checks for a configured API key first) and watched.
+      navigate(`/projects/${activeProjectId}/agents/${agent.id}`);
     } catch (err) {
       setStartErrors((prev) => ({ ...prev, [agent.id]: errorMessage(err) }));
     } finally {
@@ -151,14 +156,24 @@ export function Agents() {
                   <span className="text-sm font-medium text-foreground">{agent.name}</span>
                   <span className="text-xs text-muted-foreground">status: {agent.status}</span>
                 </div>
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  onClick={() => void handleStart(agent)}
-                  disabled={startingAgentId === agent.id}
-                >
-                  {startingAgentId === agent.id ? "Creating workspace…" : "Start"}
-                </Button>
+                <div className="flex items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => activeProjectId && navigate(`/projects/${activeProjectId}/agents/${agent.id}`)}
+                    disabled={!activeProjectId}
+                  >
+                    View
+                  </Button>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => void handleStart(agent)}
+                    disabled={startingAgentId === agent.id}
+                  >
+                    {startingAgentId === agent.id ? "Creating workspace…" : "Start"}
+                  </Button>
+                </div>
               </div>
               {startError && (
                 <div className="rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-xs text-destructive">

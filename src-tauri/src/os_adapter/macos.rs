@@ -17,6 +17,13 @@ impl OperatingSystemAdapter for MacOsAdapter {
         vec![self.default_shell(), "-il".to_string()]
     }
 
+    fn one_shot_shell_invocation(&self, command: &str) -> Vec<String> {
+        // `-l` (login, for PATH/nvm/rustup shims) + `-c` (run one command
+        // and exit) rather than `-i` — an interactive shell would otherwise
+        // wait on a tty that's never attached.
+        vec![self.default_shell(), "-lc".to_string(), command.to_string()]
+    }
+
     fn resolve_executable(&self, name: &str) -> Option<PathBuf> {
         let path_var = env::var_os("PATH")?;
         for dir in env::split_paths(&path_var) {

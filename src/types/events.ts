@@ -34,6 +34,13 @@ export interface ToolCallUpdatedEvent {
   toolCall: ToolCall;
 }
 
+/** Ephemeral streamed assistant text — never persisted; a `model_message`
+ * `AgentRunActivityEvent` carries the final text once the turn completes. */
+export interface AgentRunMessageDeltaEvent {
+  agentRunId: string;
+  text: string;
+}
+
 export interface NotificationCreatedEvent {
   notification: Notification;
 }
@@ -54,6 +61,7 @@ export interface ForgeEventMap {
   "agent-run:status-changed": AgentRunStatusChangedEvent;
   "agent-run:activity": AgentRunActivityEvent;
   "agent-run:tool-call-updated": ToolCallUpdatedEvent;
+  "agent-run:message-delta": AgentRunMessageDeltaEvent;
   "notification:created": NotificationCreatedEvent;
   "terminal:output": TerminalOutputEvent;
   "terminal:exit": TerminalExitEvent;

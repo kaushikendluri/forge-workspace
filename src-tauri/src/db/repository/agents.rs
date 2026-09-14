@@ -80,6 +80,25 @@ pub fn insert(conn: &Connection, project_id: &str, repository_id: &str, name: &s
     })
 }
 
+/// Updates an agent's `status` — called by `agent::tool_loop` alongside
+/// every `agent_runs` status transition (running/completed/failed/stopped)
+/// so `Agents.tsx`'s list reflects a live run without a separate poll.
+pub fn set_status(conn: &Connection, id: &str, status: AgentStatus) -> AppResult<()> {
+    let status_str = match status {
+        AgentStatus::Idle => "idle",
+        AgentStatus::Running => "running",
+        AgentStatus::Completed => "completed",
+        AgentStatus::Failed => "failed",
+        AgentStatus::Stopped => "stopped",
+    };
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE agents SET status = ?2, updated_at = ?3 WHERE id = ?1",
+        params![id, status_str, now],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,5 +136,14 @@ mod tests {
     fn get_by_id_returns_none_for_unknown_id() {
         let conn = setup_conn();
         assert!(get_by_id(&conn, "nonexistent").expect("get_by_id").is_none());
+    }
+
+    #[test]
+    fn set_status_updates_status() {
+        let conn = setup_conn();
+        let agent = insert(&conn, "p1", "r1", "Refactor Bot").expect("insert");
+        set_status(&conn, &agent.id, AgentStatus::Running).expect("set_status");
+        let fetched = get_by_id(&conn, &agent.id).expect("get_by_id").expect("exists");
+        assert_eq!(fetched.status, AgentStatus::Running);
     }
 }

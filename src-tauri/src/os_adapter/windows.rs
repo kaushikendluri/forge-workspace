@@ -22,6 +22,16 @@ impl OperatingSystemAdapter for WindowsAdapter {
         vec![self.default_shell(), "-NoLogo".to_string()]
     }
 
+    fn one_shot_shell_invocation(&self, command: &str) -> Vec<String> {
+        vec![
+            self.default_shell(),
+            "-NoLogo".to_string(),
+            "-NonInteractive".to_string(),
+            "-Command".to_string(),
+            command.to_string(),
+        ]
+    }
+
     fn resolve_executable(&self, name: &str) -> Option<PathBuf> {
         let path_var = env::var_os("PATH")?;
         let candidate_exts = ["", ".exe", ".cmd", ".bat"];

@@ -1,0 +1,466 @@
+//! The agent run loop itself: `run_agent_loop` drives a `queued` agent run
+//! to `completed`/`failed`/`stopped`, calling the Anthropic Messages API and
+//! dispatching whatever tools it asks for (via `agent::executor`) inside the
+//! run's isolated git worktree, persisting and streaming every step.
+//!
+//! Started by `commands::agent_run_commands::start_agent_run`, which
+//! registers the run's `CancellationToken` in `AppState.active_runs` and
+//! spawns this via `tauri::async_runtime::spawn` — so this function itself
+//! never returns a `Result` the caller could see; every outcome (including
+//! an unexpected internal error) is instead written to the `agent_runs` row
+//! and emitted as a `status-changed` event, since nothing is polling this
+//! task's return value.
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use rusqlite::Connection;
+use tauri::{AppHandle, Manager};
+use tokio_util::sync::CancellationToken;
+
+use crate::db::models::{
+    Agent, ActivityEventType, AgentRun, AgentRunStatus, AgentRunStopReason, AgentStatus, Workspace,
+};
+use crate::db::repository::{
+    activity_events as activity_events_repo, agent_runs as agent_runs_repo, agents as agents_repo,
+    model_configs as model_configs_repo, settings as settings_repo, workspaces as workspaces_repo,
+};
+use crate::db::DbConnection;
+use crate::error::{AppError, AppResult};
+use crate::git::{GitCliService, GitService};
+use crate::os_adapter;
+use crate::secrets;
+use crate::state::AppState;
+
+use super::anthropic_client::{AnthropicClient, AssistantContentBlock, ContentBlockParam, MessageParam, StreamOutcome};
+use super::events as agent_events;
+use super::executor::{run_one_tool_call, ExecutedTool};
+use super::schema::all_tool_definitions;
+use super::tools::ToolContext;
+
+const DEFAULT_MAX_ITERATIONS: i64 = 40;
+const DEFAULT_TOOL_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_MAX_TOKENS: u32 = 8192;
+/// Three tool calls in a row coming back as errors is treated as the agent
+/// being stuck (wrong command, missing dependency, repeatedly malformed
+/// input, ...) rather than something more retries will fix.
+const MAX_CONSECUTIVE_TOOL_ERRORS: u32 = 3;
+/// Delay before the single retry attempt on an Anthropic API error (network
+/// blip, transient 5xx/overloaded response, ...). Not exponential — this
+/// loop only ever retries once, so a fixed backoff is all there is to tune.
+const RETRY_BACKOFF: Duration = Duration::from_secs(2);
+
+/// Removes `run_id`'s entry from `AppState.active_runs` on drop — guarantees
+/// cleanup on *every* exit path out of `run_agent_loop` (normal completion,
+/// an early `return`, or an unexpected panic unwind) without repeating the
+/// removal call at each return site.
+struct ActiveRunGuard {
+    app: AppHandle,
+    run_id: String,
+}
+
+impl Drop for ActiveRunGuard {
+    fn drop(&mut self) {
+        if let Some(state) = self.app.try_state::<AppState>() {
+            if let Ok(mut runs) = state.active_runs.lock() {
+                runs.remove(&self.run_id);
+            }
+        }
+    }
+}
+
+/// Drives `agent_run_id` from `queued` to a terminal status. `cancel` is the
+/// same `CancellationToken` `start_agent_run` already registered in
+/// `AppState.active_runs` before spawning this — passed in (rather than
+/// created here) so there is no window between "the command returned Ok"
+/// and "a `stop_agent_run` call would actually find a token to cancel".
+pub async fn run_agent_loop(app: AppHandle, agent_run_id: String, cancel: CancellationToken) {
+    let _guard = ActiveRunGuard { app: app.clone(), run_id: agent_run_id.clone() };
+
+    if let Err(e) = run_agent_loop_inner(&app, &agent_run_id, &cancel).await {
+        // A hard, unrecoverable error that happened outside the per-turn/
+        // per-tool-call error handling below (e.g. the DB became
+        // unreachable, or the run/agent/workspace rows themselves are
+        // missing/inconsistent). Best-effort mark the run failed so it
+        // doesn't sit `running` forever; if even that fails there is
+        // nothing further this task can do.
+        let _ = finish_run(&app, &agent_run_id, AgentRunStatus::Failed, Some(AgentRunStopReason::Error), Some(e.to_string()));
+    }
+}
+
+fn get_conn(app: &AppHandle) -> AppResult<DbConnection> {
+    app.state::<AppState>().db.get().map_err(Into::into)
+}
+
+/// Everything the loop needs, loaded once up front.
+struct RunSetup {
+    agent_run: AgentRun,
+    agent: Agent,
+    workspace: Workspace,
+    max_iterations: i64,
+    tool_timeout: Duration,
+    test_command: Option<String>,
+    lint_command: Option<String>,
+    build_command: Option<String>,
+    model_max_tokens: u32,
+}
+
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|v| !v.trim().is_empty())
+}
+
+/// Loads the run/agent/workspace rows plus the M4 settings the loop and its
+/// tools need. Settings are read once, up front, rather than per-tool-call —
+/// a mid-run settings change (unlikely, since this is a single desktop app
+/// with one user) simply takes effect on the next run.
+fn load_run_setup(conn: &Connection, agent_run_id: &str) -> AppResult<RunSetup> {
+    let agent_run = agent_runs_repo::get_by_id(conn, agent_run_id)?
+        .ok_or_else(|| AppError::NotFound(format!("agent run {agent_run_id} not found")))?;
+    let agent = agents_repo::get_by_id(conn, &agent_run.agent_id)?
+        .ok_or_else(|| AppError::NotFound(format!("agent {} not found", agent_run.agent_id)))?;
+    let workspace_id = agent_run.workspace_id.clone().ok_or_else(|| {
+        AppError::InvalidInput(format!(
+            "agent run {agent_run_id} has no workspace — start_worktree_for_agent must succeed before start_agent_run"
+        ))
+    })?;
+    let workspace = workspaces_repo::get_by_id(conn, &workspace_id)?
+        .ok_or_else(|| AppError::NotFound(format!("workspace {workspace_id} not found")))?;
+
+    let max_iterations = settings_repo::get(conn, "agent.max_iterations")?
+        .and_then(|s| s.value.parse::<i64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_MAX_ITERATIONS);
+    let tool_timeout_ms = settings_repo::get(conn, "agent.tool_timeout_ms")?
+        .and_then(|s| s.value.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_TOOL_TIMEOUT_MS);
+    let test_command = non_empty(settings_repo::get(conn, "project.test_command")?.map(|s| s.value));
+    let lint_command = non_empty(settings_repo::get(conn, "project.lint_command")?.map(|s| s.value));
+    let build_command = non_empty(settings_repo::get(conn, "project.build_command")?.map(|s| s.value));
+
+    let model_max_tokens = model_configs_repo::list(conn)?
+        .into_iter()
+        .find(|m| m.model_id == agent_run.model_id)
+        .map(|m| m.max_output_tokens as u32)
+        .unwrap_or(DEFAULT_MAX_TOKENS);
+
+    Ok(RunSetup {
+        agent_run,
+        agent,
+        workspace,
+        max_iterations,
+        tool_timeout: Duration::from_millis(tool_timeout_ms),
+        test_command,
+        lint_command,
+        build_command,
+        model_max_tokens,
+    })
+}
+
+fn build_system_prompt(setup: &RunSetup) -> String {
+    format!(
+        "You are an autonomous coding agent named \"{agent_name}\", working inside a dedicated, isolated git \
+         worktree at `{workspace_root}` on branch `{branch}` (based on `{base}`). Nothing outside this worktree is \
+         reachable through your tools.\n\n\
+         Your task:\n{task}\n\n\
+         Rules:\n\
+         - Use the provided tools to explore, read, and edit the codebase. Read a file before editing it — never \
+           assume its contents.\n\
+         - All filesystem tools are sandboxed to this worktree; every path must be relative to its root.\n\
+         - Prefer the configured `run_tests`/`run_linter`/`run_build` tools over guessing whether a change works — \
+           if one isn't configured for this project, it will tell you rather than silently doing nothing.\n\
+         - When the task is fully done (or you determine it cannot be completed), call `report_completion` exactly \
+           once with a clear summary and whether you succeeded. That is the only way this run ends — stopping \
+           without calling it leaves the task incomplete.\n",
+        agent_name = setup.agent.name,
+        workspace_root = setup.workspace.path,
+        branch = setup.workspace.branch_name,
+        base = setup.workspace.base_branch.as_deref().unwrap_or("(unknown)"),
+        task = setup.agent_run.task_prompt,
+    )
+}
+
+fn to_content_block_param(block: &AssistantContentBlock) -> ContentBlockParam {
+    match block {
+        AssistantContentBlock::Text(text) => ContentBlockParam::Text { text: text.clone() },
+        AssistantContentBlock::ToolUse { id, name, input } => {
+            ContentBlockParam::ToolUse { id: id.clone(), name: name.clone(), input: input.clone() }
+        }
+    }
+}
+
+/// One `stream_turn` call, with a single retry-with-backoff on a genuine API
+/// error (network failure, non-2xx response, a server-sent `error` event, a
+/// malformed stream). A `StreamOutcome::Cancelled` is not retried — it's not
+/// a failure, it's `stop_agent_run` having fired.
+#[allow(clippy::too_many_arguments)]
+async fn call_with_retry(
+    app: &AppHandle,
+    agent_run_id: &str,
+    client: &AnthropicClient,
+    model: &str,
+    max_tokens: u32,
+    system: &str,
+    messages: &[MessageParam],
+    tools: &[super::anthropic_client::ToolDefinition],
+    cancel: &CancellationToken,
+) -> AppResult<StreamOutcome> {
+    let mut last_err: Option<AppError> = None;
+    for attempt in 0..2u8 {
+        if attempt > 0 {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Ok(StreamOutcome::Cancelled),
+                _ = tokio::time::sleep(RETRY_BACKOFF) => {}
+            }
+        }
+
+        let app_for_delta = app.clone();
+        let run_id_for_delta = agent_run_id.to_string();
+        let result = client
+            .stream_turn(model, max_tokens, system, messages, tools, cancel, |text: &str| {
+                let _ = agent_events::message_delta(&app_for_delta, &run_id_for_delta, text);
+            })
+            .await;
+
+        match result {
+            Ok(outcome) => return Ok(outcome),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| AppError::Other("Anthropic API request failed".to_string())))
+}
+
+/// Writes the run's terminal status, mirrors it onto the owning `agent` row,
+/// records a closing activity event, and emits both status-changed events.
+/// Called exactly once per run, from whichever branch of the loop below
+/// determines the run is over.
+fn finish_run(
+    app: &AppHandle,
+    agent_run_id: &str,
+    status: AgentRunStatus,
+    stop_reason: Option<AgentRunStopReason>,
+    error_message: Option<String>,
+) -> AppResult<()> {
+    let agent_id = {
+        let conn = get_conn(app)?;
+        agent_runs_repo::mark_finished(&conn, agent_run_id, status, stop_reason, error_message.as_deref())?;
+        let run = agent_runs_repo::get_by_id(&conn, agent_run_id)?
+            .ok_or_else(|| AppError::NotFound(format!("agent run {agent_run_id} not found")))?;
+
+        let agent_status = match status {
+            AgentRunStatus::Completed => AgentStatus::Completed,
+            AgentRunStatus::Failed => AgentStatus::Failed,
+            AgentRunStatus::Stopped => AgentStatus::Stopped,
+            AgentRunStatus::Queued | AgentRunStatus::Running => AgentStatus::Idle,
+        };
+        agents_repo::set_status(&conn, &run.agent_id, agent_status)?;
+
+        let event_type = match status {
+            AgentRunStatus::Completed => ActivityEventType::RunCompleted,
+            AgentRunStatus::Stopped => ActivityEventType::RunStopped,
+            _ => ActivityEventType::Error,
+        };
+        let payload = serde_json::json!({
+            "status": status,
+            "stopReason": stop_reason,
+            "errorMessage": error_message,
+        })
+        .to_string();
+        let event = activity_events_repo::insert(&conn, agent_run_id, None, event_type, &payload)?;
+        agent_events::activity(app, agent_run_id, event)?;
+
+        run.agent_id
+    };
+
+    let agent_status = match status {
+        AgentRunStatus::Completed => AgentStatus::Completed,
+        AgentRunStatus::Failed => AgentStatus::Failed,
+        AgentRunStatus::Stopped => AgentStatus::Stopped,
+        AgentRunStatus::Queued | AgentRunStatus::Running => AgentStatus::Idle,
+    };
+    agent_events::run_status_changed(app, agent_run_id, &agent_id, status)?;
+    agent_events::agent_status_changed(app, &agent_id, agent_status)?;
+    Ok(())
+}
+
+async fn run_agent_loop_inner(app: &AppHandle, agent_run_id: &str, cancel: &CancellationToken) -> AppResult<()> {
+    let setup = {
+        let conn = get_conn(app)?;
+        load_run_setup(&conn, agent_run_id)?
+    };
+
+    if setup.agent_run.status != AgentRunStatus::Queued {
+        // `start_agent_run` already checks this, but the loop re-checks in
+        // case it was somehow invoked twice for the same run.
+        return Err(AppError::InvalidInput(format!(
+            "agent run {agent_run_id} is not queued (status: {:?})",
+            setup.agent_run.status
+        )));
+    }
+
+    // `keyring` is a synchronous OS call; run it on the blocking pool rather
+    // than stalling this async task's worker thread.
+    let api_key = tauri::async_runtime::spawn_blocking(|| secrets::get_secret(secrets::ANTHROPIC_API_KEY))
+        .await
+        .map_err(|e| AppError::Other(format!("API key lookup panicked: {e}")))??;
+    let Some(api_key) = api_key else {
+        finish_run(
+            app,
+            agent_run_id,
+            AgentRunStatus::Failed,
+            Some(AgentRunStopReason::Error),
+            Some("No Anthropic API key is configured. Add one in Settings, then start this run again.".to_string()),
+        )?;
+        return Ok(());
+    };
+
+    {
+        let conn = get_conn(app)?;
+        agent_runs_repo::mark_running(&conn, agent_run_id)?;
+        agents_repo::set_status(&conn, &setup.agent.id, AgentStatus::Running)?;
+        let payload = serde_json::json!({ "taskPrompt": setup.agent_run.task_prompt }).to_string();
+        let event = activity_events_repo::insert(&conn, agent_run_id, None, ActivityEventType::RunStarted, &payload)?;
+        agent_events::activity(app, agent_run_id, event)?;
+    }
+    agent_events::run_status_changed(app, agent_run_id, &setup.agent.id, AgentRunStatus::Running)?;
+    agent_events::agent_status_changed(app, &setup.agent.id, AgentStatus::Running)?;
+
+    let client = AnthropicClient::new(api_key)?;
+    let tool_defs = all_tool_definitions();
+    let workspace_root = PathBuf::from(&setup.workspace.path);
+    let system_prompt = build_system_prompt(&setup);
+    let model_id = setup.agent_run.model_id.clone();
+
+    // Fresh instances rather than reaching into `AppState` — both are cheap
+    // (a zero-sized adapter struct, a `git` path lookup) and this sidesteps
+    // holding a borrow of `AppState` across the `.await` points below.
+    let os_adapter = os_adapter::current();
+    let git_service: Box<dyn GitService> = Box::new(GitCliService::new(os_adapter.as_ref()));
+
+    let mut messages = vec![MessageParam::user_text(setup.agent_run.task_prompt.clone())];
+    let mut consecutive_tool_errors: u32 = 0;
+    let mut sequence_number: i64 = 0;
+
+    for iteration in 1..=setup.max_iterations {
+        if cancel.is_cancelled() {
+            finish_run(app, agent_run_id, AgentRunStatus::Stopped, Some(AgentRunStopReason::UserStopped), None)?;
+            return Ok(());
+        }
+
+        let outcome = call_with_retry(
+            app,
+            agent_run_id,
+            &client,
+            &model_id,
+            setup.model_max_tokens,
+            &system_prompt,
+            &messages,
+            &tool_defs,
+            cancel,
+        )
+        .await;
+
+        let turn = match outcome {
+            Ok(StreamOutcome::Turn(turn)) => turn,
+            Ok(StreamOutcome::Cancelled) => {
+                finish_run(app, agent_run_id, AgentRunStatus::Stopped, Some(AgentRunStopReason::UserStopped), None)?;
+                return Ok(());
+            }
+            Err(e) => {
+                finish_run(app, agent_run_id, AgentRunStatus::Failed, Some(AgentRunStopReason::Error), Some(e.to_string()))?;
+                return Ok(());
+            }
+        };
+
+        {
+            let conn = get_conn(app)?;
+            agent_runs_repo::record_iteration_usage(&conn, agent_run_id, turn.usage.input_tokens, turn.usage.output_tokens)?;
+            let payload = serde_json::json!({
+                "iteration": iteration,
+                "text": turn.text(),
+                "stopReason": turn.stop_reason,
+                "usage": { "inputTokens": turn.usage.input_tokens, "outputTokens": turn.usage.output_tokens },
+            })
+            .to_string();
+            let event = activity_events_repo::insert(&conn, agent_run_id, None, ActivityEventType::ModelMessage, &payload)?;
+            agent_events::activity(app, agent_run_id, event)?;
+        }
+
+        let tool_uses: Vec<(String, String, serde_json::Value)> =
+            turn.tool_uses().map(|(id, name, input)| (id.to_string(), name.to_string(), input.clone())).collect();
+
+        if tool_uses.is_empty() {
+            // The model stopped talking without calling any tool at all —
+            // including `report_completion`. Treated as a (weak) completion
+            // rather than a failure: there's no tool error to report, and
+            // refusing to end the run would just spin until max_iterations.
+            finish_run(app, agent_run_id, AgentRunStatus::Completed, Some(AgentRunStopReason::Completed), None)?;
+            return Ok(());
+        }
+
+        let assistant_blocks: Vec<ContentBlockParam> = turn.content.iter().map(to_content_block_param).collect();
+        messages.push(MessageParam::assistant(assistant_blocks));
+
+        let ctx = ToolContext {
+            workspace_root: workspace_root.clone(),
+            git_service: git_service.as_ref(),
+            os_adapter: os_adapter.as_ref(),
+            test_command: setup.test_command.clone(),
+            lint_command: setup.lint_command.clone(),
+            build_command: setup.build_command.clone(),
+            tool_timeout: setup.tool_timeout,
+            cancel: cancel.clone(),
+        };
+
+        let mut tool_results: Vec<ContentBlockParam> = Vec::with_capacity(tool_uses.len());
+        let mut ended: Option<(bool, String)> = None;
+
+        for (tool_use_id, tool_name, input) in tool_uses {
+            if cancel.is_cancelled() {
+                finish_run(app, agent_run_id, AgentRunStatus::Stopped, Some(AgentRunStopReason::UserStopped), None)?;
+                return Ok(());
+            }
+
+            sequence_number += 1;
+            let executed =
+                run_one_tool_call(app, &ctx, agent_run_id, sequence_number, &tool_use_id, &tool_name, &input).await?;
+
+            match executed {
+                ExecutedTool::ToolResult { block, is_error } => {
+                    consecutive_tool_errors = if is_error { consecutive_tool_errors + 1 } else { 0 };
+                    tool_results.push(block);
+                    if consecutive_tool_errors >= MAX_CONSECUTIVE_TOOL_ERRORS {
+                        finish_run(
+                            app,
+                            agent_run_id,
+                            AgentRunStatus::Failed,
+                            Some(AgentRunStopReason::Error),
+                            Some(format!(
+                                "{MAX_CONSECUTIVE_TOOL_ERRORS} consecutive tool calls failed — stopping rather than looping."
+                            )),
+                        )?;
+                        return Ok(());
+                    }
+                }
+                ExecutedTool::Completion { summary, success } => {
+                    ended = Some((success, summary));
+                    break;
+                }
+            }
+        }
+
+        if let Some((success, summary)) = ended {
+            let status = if success { AgentRunStatus::Completed } else { AgentRunStatus::Failed };
+            let stop_reason = Some(if success { AgentRunStopReason::Completed } else { AgentRunStopReason::Error });
+            let error_message = if success { None } else { Some(summary) };
+            finish_run(app, agent_run_id, status, stop_reason, error_message)?;
+            return Ok(());
+        }
+
+        messages.push(MessageParam::user_tool_results(tool_results));
+    }
+
+    finish_run(app, agent_run_id, AgentRunStatus::Stopped, Some(AgentRunStopReason::MaxIterations), None)?;
+    Ok(())
+}

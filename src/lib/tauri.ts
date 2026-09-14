@@ -10,7 +10,10 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  ActivityEvent,
   Agent,
+  AgentRun,
+  AgentRunFileDiffDto,
   BranchInfo,
   CommitInfo,
   DirEntryDto,
@@ -23,6 +26,7 @@ import type {
   ProjectDto,
   Repository,
   Task,
+  ToolCall,
   Workspace,
 } from "@/types/db";
 
@@ -53,6 +57,13 @@ export interface CommandMap {
   create_agent: { args: { projectId: string; name: string }; result: Agent };
   start_worktree_for_agent: { args: { agentId: string; taskPrompt: string }; result: Workspace };
   remove_agent_workspace: { args: { workspaceId: string }; result: void };
+  start_agent_run: { args: { agentRunId: string }; result: void };
+  stop_agent_run: { args: { agentRunId: string }; result: void };
+  get_agent_run: { args: { agentRunId: string }; result: AgentRun };
+  list_agent_runs: { args: { agentId: string }; result: AgentRun[] };
+  list_tool_calls: { args: { agentRunId: string }; result: ToolCall[] };
+  list_activity_events: { args: { agentRunId: string }; result: ActivityEvent[] };
+  get_run_diff: { args: { agentRunId: string }; result: AgentRunFileDiffDto[] };
   get_setting: { args: { key: string }; result: string | null };
   set_setting: { args: { key: string; value: string }; result: void };
   list_settings: { args: Record<string, never>; result: Record<string, string> };
@@ -225,4 +236,44 @@ export async function startWorktreeForAgent(agentId: string, taskPrompt: string)
 /** Removes the worktree backing `workspaceId` and marks it removed. Fails if the worktree has uncommitted changes. */
 export async function removeAgentWorkspace(workspaceId: string): Promise<void> {
   return invokeCommand("remove_agent_workspace", { workspaceId });
+}
+
+/**
+ * Starts the real tool-calling loop for `agentRunId`, which must currently
+ * be `queued` (i.e. `startWorktreeForAgent` already ran for it). Progress
+ * arrives entirely through events (`agent-run:*`) — this only kicks the run
+ * off.
+ */
+export async function startAgentRun(agentRunId: string): Promise<void> {
+  return invokeCommand("start_agent_run", { agentRunId });
+}
+
+/** Cancels a currently-active run. Errors if `agentRunId` isn't active. */
+export async function stopAgentRun(agentRunId: string): Promise<void> {
+  return invokeCommand("stop_agent_run", { agentRunId });
+}
+
+/** The current state of one agent run. */
+export async function getAgentRun(agentRunId: string): Promise<AgentRun> {
+  return invokeCommand("get_agent_run", { agentRunId });
+}
+
+/** All runs for `agentId`, most recently started first. */
+export async function listAgentRuns(agentId: string): Promise<AgentRun[]> {
+  return invokeCommand("list_agent_runs", { agentId });
+}
+
+/** All tool calls for a run, in call order. */
+export async function listToolCalls(agentRunId: string): Promise<ToolCall[]> {
+  return invokeCommand("list_tool_calls", { agentRunId });
+}
+
+/** The full activity feed for a run, oldest first. */
+export async function listActivityEvents(agentRunId: string): Promise<ActivityEvent[]> {
+  return invokeCommand("list_activity_events", { agentRunId });
+}
+
+/** A real diff of everything currently changed in the run's workspace. */
+export async function getRunDiff(agentRunId: string): Promise<AgentRunFileDiffDto[]> {
+  return invokeCommand("get_run_diff", { agentRunId });
 }

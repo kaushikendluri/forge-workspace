@@ -11,6 +11,11 @@ pub const AGENT_STATUS_CHANGED: &str = "agent:status-changed";
 pub const AGENT_RUN_STATUS_CHANGED: &str = "agent-run:status-changed";
 pub const AGENT_RUN_ACTIVITY: &str = "agent-run:activity";
 pub const AGENT_RUN_TOOL_CALL_UPDATED: &str = "agent-run:tool-call-updated";
+/// Ephemeral streamed assistant text (`content_block_delta` `text_delta`
+/// chunks) — never persisted, purely a live "typing" feed for the UI. A
+/// `model_message` `AGENT_RUN_ACTIVITY` event carries the final, persisted
+/// text once the turn completes.
+pub const AGENT_RUN_MESSAGE_DELTA: &str = "agent-run:message-delta";
 pub const NOTIFICATION_CREATED: &str = "notification:created";
 pub const TERMINAL_OUTPUT: &str = "terminal:output";
 pub const TERMINAL_EXIT: &str = "terminal:exit";
