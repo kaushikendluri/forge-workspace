@@ -562,7 +562,10 @@ mod tests {
 
         let mut decoder = SseDecoder::new();
         let events = decoder.feed(raw.as_bytes());
-        assert_eq!(events.len(), 9, "should decode all 9 SSE events in one feed");
+        // message_start(1) + content_block_start(2) + content_block_delta(4: one
+        // text_delta, three input_json_delta chunks) + content_block_stop(2) +
+        // message_delta(1) + message_stop(1) = 11.
+        assert_eq!(events.len(), 11, "should decode all 11 SSE events in one feed");
 
         let mut acc = StreamAccumulator::default();
         let mut deltas = Vec::new();
