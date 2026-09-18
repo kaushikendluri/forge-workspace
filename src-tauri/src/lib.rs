@@ -7,6 +7,7 @@
 //! - `db`       — SQLite pool, migrations, row models, per-table repositories
 //! - `os_adapter` — platform-specific shell/PATH/env behavior
 //! - `git`      — git CLI wrapper (worktrees, status, diff)
+//! - `orchestrator` — mission planning (M8): objective -> structured, human-approved task plan
 //! - `terminal` — PTY-backed terminal sessions
 //! - `secrets`  — OS keychain-backed API key storage
 //! - `events`   — typed event emission helpers
@@ -19,6 +20,7 @@ pub mod db;
 pub mod error;
 pub mod events;
 pub mod git;
+pub mod orchestrator;
 pub mod os_adapter;
 pub mod secrets;
 pub mod state;
@@ -100,6 +102,11 @@ pub fn run() {
             commands::agent_run_commands::list_tool_calls,
             commands::agent_run_commands::list_activity_events,
             commands::agent_run_commands::get_run_diff,
+            commands::mission_commands::create_mission,
+            commands::mission_commands::approve_mission_plan,
+            commands::mission_commands::get_mission,
+            commands::mission_commands::list_missions,
+            commands::mission_commands::list_mission_tasks,
         ])
         .run(tauri::generate_context!())
         .expect("error while running forge-workspace");

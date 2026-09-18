@@ -90,6 +90,29 @@ struct MessagesRequest<'a> {
     stream: bool,
 }
 
+/// `tool_choice: {"type": "tool", "name": "..."}` — forces the model to call
+/// exactly the named tool rather than optionally choosing among several or
+/// replying in prose, per Anthropic's documented `tool_choice` shapes. Used
+/// by [`AnthropicClient::request_structured_tool_call`] to guarantee a
+/// structured-output response.
+#[derive(Debug, Serialize)]
+struct ToolChoice<'a> {
+    #[serde(rename = "type")]
+    kind: &'a str,
+    name: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct SingleTurnRequest<'a> {
+    model: &'a str,
+    max_tokens: u32,
+    system: &'a str,
+    messages: &'a [MessageParam],
+    tools: &'a [ToolDefinition],
+    tool_choice: ToolChoice<'a>,
+    stream: bool,
+}
+
 // ---------------------------------------------------------------------
 // Response-side types: one fully-materialized assistant turn
 // ---------------------------------------------------------------------
@@ -269,6 +292,30 @@ enum ContentBlockDelta {
 #[derive(Debug, Deserialize)]
 struct MessageDeltaInner {
     stop_reason: Option<String>,
+}
+
+// ---------------------------------------------------------------------
+// Non-streaming response shape (`stream: false`) — one JSON body rather
+// than an SSE event sequence. Reuses `ContentBlockStart` for the response's
+// `content` array: a non-streaming `tool_use`/`text` block has exactly the
+// same fields (`id`/`name`/`input` or `text`) as a streamed block's opening
+// event, just already complete.
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Default, Deserialize)]
+struct NonStreamUsage {
+    #[serde(default)]
+    input_tokens: i64,
+    #[serde(default)]
+    output_tokens: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct NonStreamResponse {
+    content: Vec<ContentBlockStart>,
+    stop_reason: Option<String>,
+    #[serde(default)]
+    usage: NonStreamUsage,
 }
 
 #[derive(Debug, Deserialize)]
@@ -502,6 +549,92 @@ impl AnthropicClient {
 
         Ok(StreamOutcome::Turn(accumulator.finish()?))
     }
+
+    /// Sends one **non-streaming** (`stream: false`) Messages API request
+    /// with a forced `tool_choice`, guaranteeing the response is exactly one
+    /// call to `tool.name` rather than optional tool use or prose — for a
+    /// single structured-output request (e.g. the M8 mission planner's
+    /// `propose_plan` call), not the multi-turn tool-calling agent loop
+    /// `stream_turn`/`tool_loop` drives. Reuses this client's HTTP/auth
+    /// plumbing and returns the same [`StreamOutcome`]/[`AssistantTurn`]
+    /// shape as `stream_turn` so callers can share result-handling code,
+    /// even though nothing is actually streamed here — there's no live
+    /// "typing" feed for one structured JSON response.
+    pub async fn request_structured_tool_call(
+        &self,
+        model: &str,
+        max_tokens: u32,
+        system: &str,
+        messages: &[MessageParam],
+        tool: &ToolDefinition,
+        cancel: &CancellationToken,
+    ) -> AppResult<StreamOutcome> {
+        let tools = std::slice::from_ref(tool);
+        let body = SingleTurnRequest {
+            model,
+            max_tokens,
+            system,
+            messages,
+            tools,
+            tool_choice: ToolChoice { kind: "tool", name: &tool.name },
+            stream: false,
+        };
+
+        let send_fut = self
+            .http
+            .post(API_URL)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("content-type", "application/json")
+            .json(&body)
+            .send();
+
+        let response = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Ok(StreamOutcome::Cancelled),
+            result = send_fut => result.map_err(|e| AppError::Other(format!("Anthropic API request failed: {e}")))?,
+        };
+
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(AppError::Other(format!(
+                "Anthropic API returned HTTP {status}: {text}"
+            )));
+        }
+
+        let body_fut = response.bytes();
+        let bytes = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Ok(StreamOutcome::Cancelled),
+            result = body_fut => result.map_err(|e| AppError::Other(format!("Anthropic API response read failed: {e}")))?,
+        };
+
+        let parsed: NonStreamResponse = serde_json::from_slice(&bytes).map_err(|e| {
+            AppError::Other(format!(
+                "failed to parse Anthropic response: {e} (raw: {})",
+                String::from_utf8_lossy(&bytes)
+            ))
+        })?;
+
+        let content = parsed
+            .content
+            .into_iter()
+            .filter_map(|block| match block {
+                ContentBlockStart::Text { text } => Some(AssistantContentBlock::Text(text)),
+                ContentBlockStart::ToolUse { id, name, input } => {
+                    Some(AssistantContentBlock::ToolUse { id, name, input })
+                }
+                ContentBlockStart::Unknown => None,
+            })
+            .collect();
+
+        Ok(StreamOutcome::Turn(AssistantTurn {
+            content,
+            stop_reason: parsed.stop_reason,
+            usage: TurnUsage { input_tokens: parsed.usage.input_tokens, output_tokens: parsed.usage.output_tokens },
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -658,5 +791,71 @@ mod tests {
         let mut acc = StreamAccumulator::default();
         let raw = serde_json::json!({"type": "some_future_event_type", "whatever": 1}).to_string();
         acc.apply(&raw, &mut |_: &str| {}).expect("unknown event types should be skipped, not error");
+    }
+
+    /// A real non-streaming (`stream: false`) Messages API response body
+    /// with `tool_choice: {"type": "tool", "name": "propose_plan"}" forcing
+    /// a single `tool_use` block — the exact shape
+    /// `AnthropicClient::request_structured_tool_call` parses for the M8
+    /// mission planner. Unlike the streamed shape, `input` here arrives
+    /// fully-formed in one JSON body rather than accumulated across
+    /// `input_json_delta` chunks, so this exercises the `NonStreamResponse`
+    /// -> `AssistantTurn` conversion path instead of `StreamAccumulator`.
+    #[test]
+    fn non_stream_response_with_forced_tool_use_parses_into_one_tool_use_block() {
+        let raw = serde_json::json!({
+            "id": "msg_01XYZ",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-5",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_01Plan",
+                    "name": "propose_plan",
+                    "input": { "tasks": [{ "id": "1", "title": "Set up schema", "agent_type": "backend" }] }
+                }
+            ],
+            "stop_reason": "tool_use",
+            "stop_sequence": null,
+            "usage": { "input_tokens": 512, "output_tokens": 128 }
+        })
+        .to_string();
+
+        let parsed: NonStreamResponse = serde_json::from_str(&raw).expect("should parse a real non-streaming body");
+        assert_eq!(parsed.stop_reason.as_deref(), Some("tool_use"));
+        assert_eq!(parsed.usage.input_tokens, 512);
+        assert_eq!(parsed.usage.output_tokens, 128);
+        assert_eq!(parsed.content.len(), 1);
+        match &parsed.content[0] {
+            ContentBlockStart::ToolUse { id, name, input } => {
+                assert_eq!(id, "toolu_01Plan");
+                assert_eq!(name, "propose_plan");
+                assert_eq!(input["tasks"][0]["title"], "Set up schema");
+            }
+            other => panic!("expected a tool_use block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_stream_response_with_unrecognized_block_type_is_skipped_not_a_parse_failure() {
+        // A hypothetical future block type (e.g. `thinking`) alongside the
+        // forced tool_use — `ContentBlockStart`'s `#[serde(other)]` fallback
+        // means this still parses, and the conversion in
+        // `request_structured_tool_call` drops the unrecognized block rather
+        // than failing the whole response.
+        let raw = serde_json::json!({
+            "content": [
+                { "type": "thinking", "thinking": "reasoning about the plan..." },
+                { "type": "tool_use", "id": "toolu_1", "name": "propose_plan", "input": { "tasks": [] } }
+            ],
+            "stop_reason": "tool_use",
+            "usage": { "input_tokens": 10, "output_tokens": 5 }
+        })
+        .to_string();
+
+        let parsed: NonStreamResponse = serde_json::from_str(&raw).expect("should parse despite the unknown block type");
+        assert_eq!(parsed.content.len(), 2);
+        assert!(matches!(parsed.content[0], ContentBlockStart::Unknown));
     }
 }

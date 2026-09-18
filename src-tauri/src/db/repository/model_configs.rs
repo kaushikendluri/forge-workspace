@@ -33,7 +33,6 @@ pub fn list(conn: &Connection) -> AppResult<Vec<ModelConfig>> {
     Ok(rows)
 }
 
-#[allow(dead_code)]
 pub fn get_default(conn: &Connection) -> AppResult<Option<ModelConfig>> {
     use rusqlite::OptionalExtension;
     conn.query_row(

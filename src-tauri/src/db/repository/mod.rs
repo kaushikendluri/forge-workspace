@@ -5,6 +5,7 @@
 pub mod activity_events;
 pub mod agent_runs;
 pub mod agents;
+pub mod missions;
 pub mod model_configs;
 pub mod notifications;
 pub mod projects;

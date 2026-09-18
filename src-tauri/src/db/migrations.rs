@@ -12,7 +12,10 @@ use crate::error::{AppError, AppResult};
 /// time relative to this file, so the embedded SQL is baked into the binary
 /// — no runtime dependency on the `migrations/` directory existing.
 fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(include_str!("../../migrations/0001_init.sql"))])
+    Migrations::new(vec![
+        M::up(include_str!("../../migrations/0001_init.sql")),
+        M::up(include_str!("../../migrations/0002_missions.sql")),
+    ])
 }
 
 /// Brings `conn`'s schema up to the latest migration.

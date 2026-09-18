@@ -211,17 +211,59 @@ export interface ActivityEvent {
   createdAt: IsoDateTime;
 }
 
-export type TaskStatus = "todo" | "in_progress" | "done";
+/**
+ * `backlog` is a task proposed by a mission's plan (M8) that hasn't been
+ * started yet — distinct from `todo` so a freshly-approved plan's tasks read
+ * honestly rather than looking like manually triaged work.
+ */
+export type TaskStatus = "backlog" | "todo" | "in_progress" | "done";
+export type TaskPriority = "low" | "medium" | "high";
 
 export interface Task {
   id: string;
   projectId: string;
+  /** The mission (M8) that proposed this task, if any — `null` for a task created directly. */
+  missionId: string | null;
   title: string;
   description: string | null;
   status: TaskStatus;
+  priority: TaskPriority;
+  /** Display order within its mission's plan (0-based). */
+  position: number;
+  /** Another task that must complete before this one can start, if any. */
+  dependsOnTaskId: string | null;
+  /**
+   * The plan's suggested specialist role for this task (e.g. "frontend",
+   * "backend", "database", "qa") — a free-form label, not a foreign key to
+   * anything (Agent Skills don't exist until Phase 5).
+   */
+  agentType: string | null;
   agentRunId: string | null;
   createdAt: IsoDateTime;
   updatedAt: IsoDateTime;
+}
+
+export type MissionStatus = "planning" | "plan_ready" | "approved" | "running" | "completed" | "failed";
+
+/**
+ * A mission (M8): a plain-English objective, turned into a structured task
+ * plan (real `Task` rows with `missionId` set) by one Anthropic call, which
+ * the user reviews and approves before anything executes. Mirrors
+ * `src-tauri/src/db/models.rs`'s `Mission`. Nothing in this phase advances a
+ * mission past `approved` — execution is a later milestone.
+ */
+export interface Mission {
+  id: string;
+  projectId: string;
+  objective: string;
+  status: MissionStatus;
+  /** The raw `propose_plan` model output, once the plan is ready. */
+  planJson: string | null;
+  /** The real planner error when `status` is `failed` — never a generic message. */
+  errorMessage: string | null;
+  createdAt: IsoDateTime;
+  approvedAt: IsoDateTime | null;
+  completedAt: IsoDateTime | null;
 }
 
 export interface ModelConfig {

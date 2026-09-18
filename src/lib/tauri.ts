@@ -20,6 +20,7 @@ import type {
   FilePreviewDto,
   GitFileDiff,
   GitStatus,
+  Mission,
   ModelConfig,
   Notification,
   Project,
@@ -74,6 +75,11 @@ export interface CommandMap {
   list_notifications: { args: { projectId: string | null }; result: Notification[] };
   mark_notification_read: { args: { id: string }; result: void };
   unread_notification_count: { args: { projectId: string | null }; result: number };
+  create_mission: { args: { projectId: string; objective: string }; result: Mission };
+  approve_mission_plan: { args: { missionId: string }; result: void };
+  get_mission: { args: { missionId: string }; result: Mission };
+  list_missions: { args: { projectId: string }; result: Mission[] };
+  list_mission_tasks: { args: { missionId: string }; result: Task[] };
 }
 
 /**
@@ -212,6 +218,39 @@ export async function markNotificationRead(id: string): Promise<void> {
 /** Count of unread notifications for `projectId` (or every project, if `null`). */
 export async function unreadNotificationCount(projectId: string | null): Promise<number> {
   return invokeCommand("unread_notification_count", { projectId });
+}
+
+/**
+ * Creates a mission for `projectId` and runs the real mission planner for
+ * `objective` end to end (one Anthropic call — this can take several
+ * seconds). Always resolves with the mission row, whether planning
+ * succeeded (`status: "plan_ready"`, real `Task` rows created) or failed
+ * (`status: "failed"`, `errorMessage` set to the real error) — it never
+ * rejects for a planner failure, only for a structural problem (e.g. an
+ * unknown project).
+ */
+export async function createMission(projectId: string, objective: string): Promise<Mission> {
+  return invokeCommand("create_mission", { projectId, objective });
+}
+
+/** Records human approval of a `plan_ready` mission's plan. Starts nothing — execution is a future milestone. */
+export async function approveMissionPlan(missionId: string): Promise<void> {
+  return invokeCommand("approve_mission_plan", { missionId });
+}
+
+/** The current state of one mission. */
+export async function getMission(missionId: string): Promise<Mission> {
+  return invokeCommand("get_mission", { missionId });
+}
+
+/** All missions for `projectId`, most recently created first. */
+export async function listMissions(projectId: string): Promise<Mission[]> {
+  return invokeCommand("list_missions", { projectId });
+}
+
+/** The tasks `missionId`'s plan proposed, in plan order. */
+export async function listMissionTasks(missionId: string): Promise<Task[]> {
+  return invokeCommand("list_mission_tasks", { missionId });
 }
 
 /** All agents for `projectId`, most recently created first. */
