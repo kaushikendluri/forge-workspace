@@ -6,7 +6,7 @@
 use serde::Serialize;
 use tauri::AppHandle;
 
-use crate::db::models::{ActivityEvent, AgentRunStatus, AgentStatus, ToolCall};
+use crate::db::models::{ActivityEvent, AgentRunStatus, AgentStatus, Notification, ToolCall};
 use crate::error::AppResult;
 use crate::events;
 
@@ -78,4 +78,17 @@ struct MessageDeltaPayload<'a> {
 /// never persisted (see `crate::events::AGENT_RUN_MESSAGE_DELTA`'s docs).
 pub fn message_delta(app: &AppHandle, agent_run_id: &str, text: &str) -> AppResult<()> {
     events::emit(app, events::AGENT_RUN_MESSAGE_DELTA, MessageDeltaPayload { agent_run_id, text })
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct NotificationCreatedPayload {
+    notification: Notification,
+}
+
+/// Mirrors `NotificationCreatedEvent` in `src/types/events.ts` — emitted
+/// once, right after `db::repository::notifications::insert`, so
+/// `TopBar.tsx`'s bell badge updates live without a navigate-away-and-back.
+pub fn notification_created(app: &AppHandle, notification: Notification) -> AppResult<()> {
+    events::emit(app, events::NOTIFICATION_CREATED, NotificationCreatedPayload { notification })
 }

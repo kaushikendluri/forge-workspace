@@ -11,7 +11,14 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { isTauriRuntime, listNotifications, markNotificationRead, unreadNotificationCount } from "@/lib/tauri";
+import { onForgeEvent } from "@/lib/events";
 import type { Notification } from "@/types/db";
+
+function errorMessage(err: unknown): string {
+  if (typeof err === "string") return err;
+  if (err instanceof Error) return err.message;
+  return String(err);
+}
 
 export function TopBar() {
   const activeProjectId = useProjectStore((s) => s.activeProjectId);
@@ -24,12 +31,14 @@ export function TopBar() {
   const activeProject = projects.find((p) => p.id === activeProjectId);
   const isMac = typeof navigator !== "undefined" && navigator.platform.toLowerCase().includes("mac");
 
-  // Real notifications from the `notifications` table (nothing produces any
-  // yet — that starts with agent runs in M6 — so this is genuinely empty
-  // rather than a decorative dead icon).
+  // Real notifications from the `notifications` table, produced by agent-run
+  // completion/failure/stop (M7). Kept live via the `notification:created`
+  // event so the badge updates without navigating away and back.
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [notificationsLoading, setNotificationsLoading] = useState(false);
+  const [notificationsError, setNotificationsError] = useState<string | null>(null);
   const [unreadCount, setUnreadCount] = useState(0);
+  const [isOpen, setIsOpen] = useState(false);
 
   const refreshUnreadCount = useCallback(async () => {
     if (!isTauriRuntime()) return;
@@ -44,12 +53,39 @@ export function TopBar() {
     void refreshUnreadCount();
   }, [refreshUnreadCount]);
 
+  // Live updates: a fresh agent-run outcome bumps the badge (and, if the
+  // dropdown is already open, the list itself) without waiting for the next
+  // open/close cycle.
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    void onForgeEvent("notification:created", (payload) => {
+      if (cancelled) return;
+      if (payload.notification.projectId && payload.notification.projectId !== activeProjectId) return;
+      void refreshUnreadCount();
+      setNotifications((prev) => (isOpen ? [payload.notification, ...prev] : prev));
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [activeProjectId, refreshUnreadCount, isOpen]);
+
   const handleNotificationsOpenChange = (open: boolean) => {
+    setIsOpen(open);
     if (!open || !isTauriRuntime()) return;
     setNotificationsLoading(true);
+    setNotificationsError(null);
     listNotifications(activeProjectId)
       .then(setNotifications)
-      .catch(() => setNotifications([]))
+      .catch((err) => {
+        setNotifications([]);
+        setNotificationsError(errorMessage(err));
+      })
       .finally(() => setNotificationsLoading(false));
   };
 
@@ -111,12 +147,18 @@ export function TopBar() {
           <DropdownMenuContent align="end" className="w-72 p-0">
             {notificationsLoading ? (
               <div className="px-4 py-8 text-center text-xs text-muted-foreground">Loading…</div>
+            ) : notificationsError ? (
+              <div className="flex flex-col items-center gap-1.5 px-4 py-8 text-center">
+                <Bell className="h-4 w-4 text-destructive" />
+                <p className="text-xs font-medium text-destructive">Couldn&apos;t load notifications</p>
+                <p className="text-xs text-muted-foreground">{notificationsError}</p>
+              </div>
             ) : notifications.length === 0 ? (
               <div className="flex flex-col items-center gap-1.5 px-4 py-8 text-center">
                 <Bell className="h-4 w-4 text-subtle-foreground" />
                 <p className="text-xs font-medium text-foreground">No notifications</p>
                 <p className="text-xs text-muted-foreground">
-                  You&apos;ll see agent run updates here once agents can run.
+                  You&apos;ll see agent run updates here as agents finish running.
                 </p>
               </div>
             ) : (

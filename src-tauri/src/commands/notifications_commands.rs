@@ -1,7 +1,8 @@
-//! Commands backing `TopBar.tsx`'s notification bell. Nothing produces real
-//! notifications yet (that starts with agent-run completion in M6) — these
-//! commands make the read/write path real so the bell shows a genuine "no
-//! notifications yet" empty state rather than being unwired.
+//! Commands backing `TopBar.tsx`'s notification bell. Real notifications are
+//! produced by `agent::tool_loop::finish_run` on every terminal agent-run
+//! transition (M7); these commands are the read/write path the bell uses to
+//! show them, plus a genuine "no notifications yet" empty state when there
+//! are none.
 
 use tauri::{AppHandle, Manager};
 

@@ -18,6 +18,7 @@ import {
   stopAgentRun,
 } from "@/lib/tauri";
 import { onForgeEvent } from "@/lib/events";
+import { toastError } from "@/stores/useToastStore";
 import { cn } from "@/lib/utils";
 import type { Agent, AgentRunFileDiffDto, AgentRunStatus, ToolCallStatus } from "@/types/db";
 
@@ -204,12 +205,16 @@ export function AgentDetail() {
           if (cancelled || payload.agentRunId !== currentRunId) return;
           // The event payload only carries the new status; refetch the full
           // row (token counts, stop reason, timestamps) rather than
-          // synthesizing a partial one.
+          // synthesizing a partial one. This runs in the background (not
+          // from a user action), so a failure has no natural inline banner
+          // to land in — surface it via toast instead of swallowing it.
           getAgentRun(currentRunId)
             .then((run) => {
               if (!cancelled) setRun(currentRunId, run);
             })
-            .catch(() => {});
+            .catch((err) => {
+              if (!cancelled) toastError("Couldn't refresh run status", errorMessage(err));
+            });
         }),
       );
       unlisten.push(
@@ -357,6 +362,9 @@ export function AgentDetail() {
             {activity.length === 0 && !isRunning && (
               <p className="text-xs text-muted-foreground">No activity yet.</p>
             )}
+            {activity.length === 0 && isRunning && !streamingText && (
+              <p className="text-xs text-muted-foreground">Waiting for the model's first response…</p>
+            )}
             {activity.map((event) => (
               <div key={event.id} className="rounded border border-border/60 bg-surface px-2 py-1.5 text-xs">
                 <div className="flex items-center justify-between gap-2">
@@ -382,7 +390,11 @@ export function AgentDetail() {
         <div className="flex flex-col gap-2 overflow-hidden">
           <h2 className="text-sm font-medium text-foreground">Tool calls</h2>
           <div className="flex flex-1 flex-col gap-1.5 overflow-y-auto rounded-md border border-border p-2">
-            {toolCalls.length === 0 && <p className="text-xs text-muted-foreground">No tool calls yet.</p>}
+            {toolCalls.length === 0 && (
+              <p className="text-xs text-muted-foreground">
+                {isTerminal ? "No tool calls — the model answered without using any tools." : "No tool calls yet."}
+              </p>
+            )}
             {toolCalls.map((call) => {
               const badge = TOOL_CALL_BADGE[call.status];
               return (

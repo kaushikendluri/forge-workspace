@@ -19,8 +19,8 @@ function errorMessage(err: unknown): string {
  * (SQLite-backed), "New agent" creates a row via `create_agent`, and each
  * agent's "Start" button calls `start_worktree_for_agent` (a real git
  * worktree + branch + queued run) and then navigates to `AgentDetail`,
- * which is where the actual tool-calling loop is started/stopped and
- * watched live.
+ * which is where the actual tool-calling loop (Anthropic tool-calling agent,
+ * real file/git/shell tools) is started/stopped and watched live.
  */
 export function Agents() {
   const navigate = useNavigate();
@@ -111,8 +111,9 @@ export function Agents() {
     <div className="flex flex-1 flex-col gap-4">
       <h1 className="text-lg font-semibold text-foreground">Agents</h1>
       <p className="text-xs text-muted-foreground">
-        Agents for <span className="font-medium text-foreground">{activeProject.name}</span>. "Start" only creates
-        an isolated git worktree and branch for a task — agent execution lands in a later milestone.
+        Agents for <span className="font-medium text-foreground">{activeProject.name}</span>. "Start" creates an
+        isolated git worktree and branch for a task, then opens the run — start it there once an API key is
+        configured.
       </p>
 
       <div className="flex items-center gap-2">
@@ -184,7 +185,6 @@ export function Agents() {
                 <p className="text-xs text-muted-foreground">
                   Workspace ready at <code className="rounded bg-surface px-1 py-0.5 font-mono">{workspace.path}</code>{" "}
                   on branch <code className="rounded bg-surface px-1 py-0.5 font-mono">{workspace.branchName}</code>.
-                  Agent execution lands in a later milestone.
                 </p>
               )}
             </div>

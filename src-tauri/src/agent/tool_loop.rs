@@ -19,11 +19,12 @@ use tauri::{AppHandle, Manager};
 use tokio_util::sync::CancellationToken;
 
 use crate::db::models::{
-    Agent, ActivityEventType, AgentRun, AgentRunStatus, AgentRunStopReason, AgentStatus, Workspace,
+    Agent, ActivityEventType, AgentRun, AgentRunStatus, AgentRunStopReason, AgentStatus, NotificationType, Workspace,
 };
 use crate::db::repository::{
     activity_events as activity_events_repo, agent_runs as agent_runs_repo, agents as agents_repo,
-    model_configs as model_configs_repo, settings as settings_repo, workspaces as workspaces_repo,
+    model_configs as model_configs_repo, notifications as notifications_repo, settings as settings_repo,
+    workspaces as workspaces_repo,
 };
 use crate::db::DbConnection;
 use crate::error::{AppError, AppResult};
@@ -84,7 +85,8 @@ pub async fn run_agent_loop(app: AppHandle, agent_run_id: String, cancel: Cancel
         // missing/inconsistent). Best-effort mark the run failed so it
         // doesn't sit `running` forever; if even that fails there is
         // nothing further this task can do.
-        let _ = finish_run(&app, &agent_run_id, AgentRunStatus::Failed, Some(AgentRunStopReason::Error), Some(e.to_string()));
+        let msg = e.to_string();
+        let _ = finish_run(&app, &agent_run_id, AgentRunStatus::Failed, Some(AgentRunStopReason::Error), Some(msg.clone()), Some(&msg));
     }
 }
 
@@ -231,22 +233,64 @@ async fn call_with_retry(
     Err(last_err.unwrap_or_else(|| AppError::Other("Anthropic API request failed".to_string())))
 }
 
+/// Derives the `(NotificationType, title, body)` for a terminal run outcome.
+/// `detail` is the specific, human-readable reason for this particular
+/// transition (a `report_completion` summary, an API error's text, "stopped
+/// by user request", ...) — when the caller has one, it's used verbatim as
+/// the body; only a genuinely detail-less transition (which no current call
+/// site actually hits) falls back to a `stop_reason`-derived sentence, so
+/// this never surfaces a bare "something happened".
+fn notification_for_outcome(
+    agent_name: &str,
+    status: AgentRunStatus,
+    stop_reason: Option<AgentRunStopReason>,
+    detail: Option<&str>,
+) -> (NotificationType, String, Option<String>) {
+    let (notification_type, verb) = match status {
+        AgentRunStatus::Completed => (NotificationType::AgentCompleted, "completed"),
+        AgentRunStatus::Failed => (NotificationType::AgentFailed, "failed"),
+        AgentRunStatus::Stopped | AgentRunStatus::Queued | AgentRunStatus::Running => {
+            (NotificationType::AgentStopped, "stopped")
+        }
+    };
+    let title = format!("\"{agent_name}\" {verb}");
+    let body = detail
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            stop_reason.map(|r| match r {
+                AgentRunStopReason::Completed => "The run finished.".to_string(),
+                AgentRunStopReason::MaxIterations => "Reached the maximum number of iterations.".to_string(),
+                AgentRunStopReason::UserStopped => "Stopped by user request.".to_string(),
+                AgentRunStopReason::Error => "The run failed.".to_string(),
+            })
+        });
+    (notification_type, title, body)
+}
+
 /// Writes the run's terminal status, mirrors it onto the owning `agent` row,
-/// records a closing activity event, and emits both status-changed events.
-/// Called exactly once per run, from whichever branch of the loop below
-/// determines the run is over.
+/// records a closing activity event, inserts a real notification, and emits
+/// the status-changed and notification-created events. Called exactly once
+/// per run, from whichever branch of the loop below determines the run is
+/// over. `notification_detail` is the specific reason for this transition
+/// (see `notification_for_outcome`) — distinct from `error_message` because
+/// a successful `report_completion` has a summary worth notifying on even
+/// though it isn't an error.
 fn finish_run(
     app: &AppHandle,
     agent_run_id: &str,
     status: AgentRunStatus,
     stop_reason: Option<AgentRunStopReason>,
     error_message: Option<String>,
+    notification_detail: Option<&str>,
 ) -> AppResult<()> {
     let agent_id = {
         let conn = get_conn(app)?;
         agent_runs_repo::mark_finished(&conn, agent_run_id, status, stop_reason, error_message.as_deref())?;
         let run = agent_runs_repo::get_by_id(&conn, agent_run_id)?
             .ok_or_else(|| AppError::NotFound(format!("agent run {agent_run_id} not found")))?;
+        let agent = agents_repo::get_by_id(&conn, &run.agent_id)?
+            .ok_or_else(|| AppError::NotFound(format!("agent {} not found", run.agent_id)))?;
 
         let agent_status = match status {
             AgentRunStatus::Completed => AgentStatus::Completed,
@@ -269,6 +313,17 @@ fn finish_run(
         .to_string();
         let event = activity_events_repo::insert(&conn, agent_run_id, None, event_type, &payload)?;
         agent_events::activity(app, agent_run_id, event)?;
+
+        let (notification_type, title, body) = notification_for_outcome(&agent.name, status, stop_reason, notification_detail);
+        let notification = notifications_repo::insert(
+            &conn,
+            Some(&agent.project_id),
+            Some(agent_run_id),
+            notification_type,
+            &title,
+            body.as_deref(),
+        )?;
+        agent_events::notification_created(app, notification)?;
 
         run.agent_id
     };
@@ -305,13 +360,8 @@ async fn run_agent_loop_inner(app: &AppHandle, agent_run_id: &str, cancel: &Canc
         .await
         .map_err(|e| AppError::Other(format!("API key lookup panicked: {e}")))??;
     let Some(api_key) = api_key else {
-        finish_run(
-            app,
-            agent_run_id,
-            AgentRunStatus::Failed,
-            Some(AgentRunStopReason::Error),
-            Some("No Anthropic API key is configured. Add one in Settings, then start this run again.".to_string()),
-        )?;
+        let msg = "No Anthropic API key is configured. Add one in Settings, then start this run again.".to_string();
+        finish_run(app, agent_run_id, AgentRunStatus::Failed, Some(AgentRunStopReason::Error), Some(msg.clone()), Some(&msg))?;
         return Ok(());
     };
 
@@ -344,7 +394,14 @@ async fn run_agent_loop_inner(app: &AppHandle, agent_run_id: &str, cancel: &Canc
 
     for iteration in 1..=setup.max_iterations {
         if cancel.is_cancelled() {
-            finish_run(app, agent_run_id, AgentRunStatus::Stopped, Some(AgentRunStopReason::UserStopped), None)?;
+            finish_run(
+                app,
+                agent_run_id,
+                AgentRunStatus::Stopped,
+                Some(AgentRunStopReason::UserStopped),
+                None,
+                Some("Stopped by user request."),
+            )?;
             return Ok(());
         }
 
@@ -364,11 +421,19 @@ async fn run_agent_loop_inner(app: &AppHandle, agent_run_id: &str, cancel: &Canc
         let turn = match outcome {
             Ok(StreamOutcome::Turn(turn)) => turn,
             Ok(StreamOutcome::Cancelled) => {
-                finish_run(app, agent_run_id, AgentRunStatus::Stopped, Some(AgentRunStopReason::UserStopped), None)?;
+                finish_run(
+                    app,
+                    agent_run_id,
+                    AgentRunStatus::Stopped,
+                    Some(AgentRunStopReason::UserStopped),
+                    None,
+                    Some("Stopped by user request."),
+                )?;
                 return Ok(());
             }
             Err(e) => {
-                finish_run(app, agent_run_id, AgentRunStatus::Failed, Some(AgentRunStopReason::Error), Some(e.to_string()))?;
+                let msg = e.to_string();
+                finish_run(app, agent_run_id, AgentRunStatus::Failed, Some(AgentRunStopReason::Error), Some(msg.clone()), Some(&msg))?;
                 return Ok(());
             }
         };
@@ -395,7 +460,9 @@ async fn run_agent_loop_inner(app: &AppHandle, agent_run_id: &str, cancel: &Canc
             // including `report_completion`. Treated as a (weak) completion
             // rather than a failure: there's no tool error to report, and
             // refusing to end the run would just spin until max_iterations.
-            finish_run(app, agent_run_id, AgentRunStatus::Completed, Some(AgentRunStopReason::Completed), None)?;
+            let text = turn.text();
+            let detail = if text.trim().is_empty() { None } else { Some(text.as_str()) };
+            finish_run(app, agent_run_id, AgentRunStatus::Completed, Some(AgentRunStopReason::Completed), None, detail)?;
             return Ok(());
         }
 
@@ -418,7 +485,14 @@ async fn run_agent_loop_inner(app: &AppHandle, agent_run_id: &str, cancel: &Canc
 
         for (tool_use_id, tool_name, input) in tool_uses {
             if cancel.is_cancelled() {
-                finish_run(app, agent_run_id, AgentRunStatus::Stopped, Some(AgentRunStopReason::UserStopped), None)?;
+                finish_run(
+                    app,
+                    agent_run_id,
+                    AgentRunStatus::Stopped,
+                    Some(AgentRunStopReason::UserStopped),
+                    None,
+                    Some("Stopped by user request."),
+                )?;
                 return Ok(());
             }
 
@@ -431,14 +505,16 @@ async fn run_agent_loop_inner(app: &AppHandle, agent_run_id: &str, cancel: &Canc
                     consecutive_tool_errors = if is_error { consecutive_tool_errors + 1 } else { 0 };
                     tool_results.push(block);
                     if consecutive_tool_errors >= MAX_CONSECUTIVE_TOOL_ERRORS {
+                        let msg = format!(
+                            "{MAX_CONSECUTIVE_TOOL_ERRORS} consecutive tool calls failed — stopping rather than looping."
+                        );
                         finish_run(
                             app,
                             agent_run_id,
                             AgentRunStatus::Failed,
                             Some(AgentRunStopReason::Error),
-                            Some(format!(
-                                "{MAX_CONSECUTIVE_TOOL_ERRORS} consecutive tool calls failed — stopping rather than looping."
-                            )),
+                            Some(msg.clone()),
+                            Some(&msg),
                         )?;
                         return Ok(());
                     }
@@ -453,14 +529,15 @@ async fn run_agent_loop_inner(app: &AppHandle, agent_run_id: &str, cancel: &Canc
         if let Some((success, summary)) = ended {
             let status = if success { AgentRunStatus::Completed } else { AgentRunStatus::Failed };
             let stop_reason = Some(if success { AgentRunStopReason::Completed } else { AgentRunStopReason::Error });
-            let error_message = if success { None } else { Some(summary) };
-            finish_run(app, agent_run_id, status, stop_reason, error_message)?;
+            let error_message = if success { None } else { Some(summary.clone()) };
+            finish_run(app, agent_run_id, status, stop_reason, error_message, Some(&summary))?;
             return Ok(());
         }
 
         messages.push(MessageParam::user_tool_results(tool_results));
     }
 
-    finish_run(app, agent_run_id, AgentRunStatus::Stopped, Some(AgentRunStopReason::MaxIterations), None)?;
+    let msg = format!("Reached the maximum of {} iterations without calling report_completion.", setup.max_iterations);
+    finish_run(app, agent_run_id, AgentRunStatus::Stopped, Some(AgentRunStopReason::MaxIterations), None, Some(&msg))?;
     Ok(())
 }

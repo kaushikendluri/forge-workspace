@@ -5,6 +5,7 @@ import { Sidebar } from "./Sidebar";
 import { TopBar } from "./TopBar";
 import { CommandPalette } from "./CommandPalette";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { ToastStack } from "@/components/ui/toast";
 import { useSettingsStore } from "@/stores/useSettingsStore";
 
 /**
@@ -58,6 +59,7 @@ export function AppShell() {
         </PanelGroup>
       </div>
       <CommandPalette />
+      <ToastStack />
     </TooltipProvider>
   );
 }

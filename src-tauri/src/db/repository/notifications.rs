@@ -1,7 +1,7 @@
-//! CRUD for the `notifications` table. Nothing produces real notifications
-//! yet (that starts with agent runs in M6) — this module just makes the
-//! read/write path real so the bell icon in `TopBar.tsx` shows a genuine
-//! "no notifications yet" empty state instead of being unwired.
+//! CRUD for the `notifications` table. `insert` is called from
+//! `agent::tool_loop::finish_run` (M7) for every terminal agent-run
+//! transition, so the bell icon in `TopBar.tsx` shows real, produced
+//! notifications rather than a permanently-empty list.
 
 use chrono::Utc;
 use rusqlite::{params, Connection};
@@ -39,11 +39,10 @@ fn type_str(t: NotificationType) -> &'static str {
     }
 }
 
-/// Inserts a new notification row and returns it. Nothing calls this yet —
-/// the first real producer is agent-run completion/failure in M6 — but the
-/// write path is real so that milestone is just "call this", not "build
-/// this".
-#[allow(dead_code, clippy::too_many_arguments)]
+/// Inserts a new notification row and returns it. Called from
+/// `agent::tool_loop::finish_run` for every terminal (`completed`/`failed`/
+/// `stopped`) agent-run transition.
+#[allow(clippy::too_many_arguments)]
 pub fn insert(
     conn: &Connection,
     project_id: Option<&str>,
