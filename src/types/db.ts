@@ -214,9 +214,14 @@ export interface ActivityEvent {
 /**
  * `backlog` is a task proposed by a mission's plan (M8) that hasn't been
  * started yet — distinct from `todo` so a freshly-approved plan's tasks read
- * honestly rather than looking like manually triaged work.
+ * honestly rather than looking like manually triaged work. M9 adds the
+ * terminal states the scheduler (`orchestrator::scheduler`) produces once a
+ * mission actually runs: `failed` (its own agent run didn't succeed),
+ * `blocked` (its dependency ended failed/blocked/cancelled, or it's part of
+ * a dependency cycle), `cancelled` (the mission was stopped before this task
+ * got a chance to run).
  */
-export type TaskStatus = "backlog" | "todo" | "in_progress" | "done";
+export type TaskStatus = "backlog" | "todo" | "in_progress" | "done" | "failed" | "blocked" | "cancelled";
 export type TaskPriority = "low" | "medium" | "high";
 
 export interface Task {
@@ -243,14 +248,16 @@ export interface Task {
   updatedAt: IsoDateTime;
 }
 
-export type MissionStatus = "planning" | "plan_ready" | "approved" | "running" | "completed" | "failed";
+export type MissionStatus = "planning" | "plan_ready" | "approved" | "running" | "completed" | "failed" | "stopped";
 
 /**
  * A mission (M8): a plain-English objective, turned into a structured task
  * plan (real `Task` rows with `missionId` set) by one Anthropic call, which
  * the user reviews and approves before anything executes. Mirrors
- * `src-tauri/src/db/models.rs`'s `Mission`. Nothing in this phase advances a
- * mission past `approved` — execution is a later milestone.
+ * `src-tauri/src/db/models.rs`'s `Mission`. M9's `orchestrator::scheduler`
+ * walks an `approved` mission's task graph and runs each task through the
+ * real M5/M6 agent pipeline, moving it to `running`, then
+ * `completed`/`failed`/`stopped`.
  */
 export interface Mission {
   id: string;

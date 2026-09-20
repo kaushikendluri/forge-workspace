@@ -4,8 +4,14 @@
 //! command task (unlike M6's `start_agent_run`, there's no multi-step
 //! progress to stream — one API call, then the frontend has its answer) and
 //! persists the result as real `tasks` rows. `approve_mission_plan` is as
-//! far as this milestone goes — nothing yet consumes `status = 'approved'`
-//! to start execution (that's a later milestone).
+//! far as M8 goes.
+//!
+//! M9 adds `start_mission`/`stop_mission`, which consume `status =
+//! 'approved'`: they mirror `commands::agent_run_commands`'s
+//! `start_agent_run`/`stop_agent_run` shape exactly — register/look up a
+//! `CancellationToken` in `AppState.active_missions`, spawn/cancel the real
+//! driver (`orchestrator::scheduler::run_mission`) — with `active_missions`
+//! standing in for `active_runs` one level up.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -23,6 +29,7 @@ use crate::db::repository::{
 use crate::error::{AppError, AppResult};
 use crate::git::{GitCliService, GitService};
 use crate::orchestrator::planner::{self, MissionPlan};
+use crate::orchestrator::scheduler;
 use crate::os_adapter;
 use crate::secrets;
 use crate::state::AppState;
@@ -238,6 +245,79 @@ pub async fn list_mission_tasks(app: AppHandle, mission_id: String) -> Result<Ve
         let state = app.state::<AppState>();
         let conn = state.db.get()?;
         tasks_repo::list_for_mission(&conn, &mission_id)
+    })
+    .await
+}
+
+/// M9: starts real execution of an `approved` mission's plan — spawns
+/// `orchestrator::scheduler::run_mission`, which walks the task dependency
+/// graph and runs each task, sequentially, through the real M5/M6 agent
+/// pipeline. Registers the mission's `CancellationToken` in
+/// `AppState.active_missions` *before* spawning the scheduler, mirroring
+/// `agent_run_commands::start_agent_run` exactly, so a `stop_mission` call
+/// made immediately after this returns is guaranteed to find it. The actual
+/// `status = 'running'` transition (and its event) happens inside
+/// `run_mission` itself, not here — same reason `start_agent_run` doesn't
+/// call `mark_running` either: the driver is what's actually about to do
+/// the work.
+#[tauri::command]
+pub async fn start_mission(app: AppHandle, mission_id: String) -> Result<(), String> {
+    let cancel = CancellationToken::new();
+    let app_for_check = app.clone();
+    let mission_id_for_check = mission_id.clone();
+    let cancel_for_check = cancel.clone();
+
+    run_blocking(move || -> AppResult<()> {
+        let state = app_for_check.state::<AppState>();
+        let conn = state.db.get()?;
+        let mission = missions_repo::get_by_id(&conn, &mission_id_for_check)?
+            .ok_or_else(|| AppError::NotFound(format!("mission {mission_id_for_check} not found")))?;
+        if mission.status != MissionStatus::Approved {
+            return Err(AppError::InvalidInput(format!(
+                "mission {mission_id_for_check} is not approved (status: {:?}) — it may already be running or finished",
+                mission.status
+            )));
+        }
+
+        let mut active_missions = state
+            .active_missions
+            .lock()
+            .map_err(|_| AppError::Other("active missions registry lock poisoned".to_string()))?;
+        if active_missions.contains_key(&mission_id_for_check) {
+            return Err(AppError::InvalidInput(format!("mission {mission_id_for_check} is already running")));
+        }
+        active_missions.insert(mission_id_for_check.clone(), cancel_for_check);
+        Ok(())
+    })
+    .await?;
+
+    let app_for_loop = app.clone();
+    tauri::async_runtime::spawn(async move {
+        scheduler::run_mission(app_for_loop, mission_id, cancel).await;
+    });
+    Ok(())
+}
+
+/// M9: cancels a currently-running mission — fires its `CancellationToken`,
+/// which `run_mission` observes between tasks (and forwards as a real
+/// `stop_agent_run` against whichever task's run is currently active).
+/// Errors if `mission_id` isn't currently active, mirroring
+/// `agent_run_commands::stop_agent_run`.
+#[tauri::command]
+pub async fn stop_mission(app: AppHandle, mission_id: String) -> Result<(), String> {
+    run_blocking(move || -> AppResult<()> {
+        let state = app.state::<AppState>();
+        let active_missions = state
+            .active_missions
+            .lock()
+            .map_err(|_| AppError::Other("active missions registry lock poisoned".to_string()))?;
+        match active_missions.get(&mission_id) {
+            Some(token) => {
+                token.cancel();
+                Ok(())
+            }
+            None => Err(AppError::NotFound(format!("mission {mission_id} is not currently active"))),
+        }
     })
     .await
 }

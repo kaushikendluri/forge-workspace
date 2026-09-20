@@ -15,6 +15,7 @@ fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(include_str!("../../migrations/0001_init.sql")),
         M::up(include_str!("../../migrations/0002_missions.sql")),
+        M::up(include_str!("../../migrations/0003_scheduler.sql")),
     ])
 }
 

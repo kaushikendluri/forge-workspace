@@ -17,6 +17,14 @@ pub const AGENT_RUN_TOOL_CALL_UPDATED: &str = "agent-run:tool-call-updated";
 /// text once the turn completes.
 pub const AGENT_RUN_MESSAGE_DELTA: &str = "agent-run:message-delta";
 pub const NOTIFICATION_CREATED: &str = "notification:created";
+/// M9: a mission-level status transition (`planning` -> ... ->
+/// `running` -> `completed`/`failed`/`stopped`), emitted by
+/// `orchestrator::scheduler::run_mission`.
+pub const MISSION_STATUS_CHANGED: &str = "mission:status-changed";
+/// M9: one task belonging to a running mission changed status (picked up,
+/// finished, blocked, cancelled), emitted alongside the real `tasks` row
+/// write so `Tasks.tsx` can reflect it live without polling.
+pub const MISSION_TASK_UPDATED: &str = "mission:task-updated";
 pub const TERMINAL_OUTPUT: &str = "terminal:output";
 pub const TERMINAL_EXIT: &str = "terminal:exit";
 

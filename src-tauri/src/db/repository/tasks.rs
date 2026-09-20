@@ -15,6 +15,9 @@ fn parse_status(s: &str) -> TaskStatus {
         "backlog" => TaskStatus::Backlog,
         "in_progress" => TaskStatus::InProgress,
         "done" => TaskStatus::Done,
+        "failed" => TaskStatus::Failed,
+        "blocked" => TaskStatus::Blocked,
+        "cancelled" => TaskStatus::Cancelled,
         _ => TaskStatus::Todo,
     }
 }
@@ -25,6 +28,9 @@ fn status_str(status: TaskStatus) -> &'static str {
         TaskStatus::Todo => "todo",
         TaskStatus::InProgress => "in_progress",
         TaskStatus::Done => "done",
+        TaskStatus::Failed => "failed",
+        TaskStatus::Blocked => "blocked",
+        TaskStatus::Cancelled => "cancelled",
     }
 }
 
@@ -177,6 +183,20 @@ pub fn update_status(conn: &Connection, id: &str, status: TaskStatus) -> AppResu
     Ok(())
 }
 
+/// Links a task to the agent run the scheduler (M9) started for it — the
+/// other half of `tasks.agent_run_id`, set once `start_worktree_for_agent`
+/// has produced a real run to link (mirrors
+/// `agent_runs::set_workspace_id`'s "link once the other row exists"
+/// shape).
+pub fn set_agent_run_id(conn: &Connection, id: &str, agent_run_id: &str) -> AppResult<()> {
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE tasks SET agent_run_id = ?2, updated_at = ?3 WHERE id = ?1",
+        params![id, agent_run_id, now],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +289,38 @@ mod tests {
         update_status(&conn, &task.id, TaskStatus::Done).expect("update_status");
         let fetched = get_by_id(&conn, &task.id).expect("get_by_id").expect("exists");
         assert_eq!(fetched.status, TaskStatus::Done);
+    }
+
+    #[test]
+    fn update_status_round_trips_every_m9_scheduler_status() {
+        let conn = setup_conn();
+        let task = create(&conn, "p1", "Ship it", None).expect("create");
+        for status in [TaskStatus::InProgress, TaskStatus::Failed, TaskStatus::Blocked, TaskStatus::Cancelled, TaskStatus::Done] {
+            update_status(&conn, &task.id, status).expect("update_status");
+            let fetched = get_by_id(&conn, &task.id).expect("get_by_id").expect("exists");
+            assert_eq!(fetched.status, status);
+        }
+    }
+
+    #[test]
+    fn set_agent_run_id_links_task_to_its_run() {
+        let conn = setup_conn();
+        conn.execute("INSERT INTO repositories (id, project_id, root_path) VALUES ('r1', 'p1', '/tmp/r1')", [])
+            .expect("insert repository");
+        conn.execute("INSERT INTO agents (id, project_id, repository_id, name) VALUES ('a1', 'p1', 'r1', 'Bot')", [])
+            .expect("insert agent");
+        conn.execute(
+            "INSERT INTO agent_runs (id, agent_id, task_prompt, model_id) VALUES ('run1', 'a1', 'do it', 'claude-sonnet-5')",
+            [],
+        )
+        .expect("insert agent_run");
+
+        let task = create(&conn, "p1", "Ship it", None).expect("create");
+        assert!(task.agent_run_id.is_none());
+
+        set_agent_run_id(&conn, &task.id, "run1").expect("set_agent_run_id");
+
+        let fetched = get_by_id(&conn, &task.id).expect("get_by_id").expect("exists");
+        assert_eq!(fetched.agent_run_id.as_deref(), Some("run1"));
     }
 }

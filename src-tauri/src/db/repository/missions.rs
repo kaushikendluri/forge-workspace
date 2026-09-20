@@ -17,6 +17,7 @@ fn parse_status(s: &str) -> MissionStatus {
         "running" => MissionStatus::Running,
         "completed" => MissionStatus::Completed,
         "failed" => MissionStatus::Failed,
+        "stopped" => MissionStatus::Stopped,
         _ => MissionStatus::Planning,
     }
 }
@@ -89,19 +90,54 @@ pub fn mark_plan_ready(conn: &Connection, id: &str, plan_json: &str) -> AppResul
 }
 
 /// Records a real planner failure (no API key configured, an Anthropic API
-/// error, a malformed plan, ...) — `error_message` is always the genuine
-/// error text, never a generic placeholder.
+/// error, a malformed plan, ...) or a real M9 execution failure (a task
+/// failed and blocked the rest of the plan) — `error_message` is always the
+/// genuine error text, never a generic placeholder. Also used by M9 for a
+/// mission that never reached `running` (e.g. an unexpected scheduler
+/// error), so it stamps `completed_at` like every other terminal
+/// transition.
 pub fn mark_failed(conn: &Connection, id: &str, error_message: &str) -> AppResult<()> {
-    conn.execute("UPDATE missions SET status = 'failed', error_message = ?2 WHERE id = ?1", params![id, error_message])?;
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE missions SET status = 'failed', error_message = ?2, completed_at = ?3 WHERE id = ?1",
+        params![id, error_message, now],
+    )?;
     Ok(())
 }
 
-/// Records human approval of a `plan_ready` mission's plan. This is as far
-/// as M8 takes a mission — nothing yet consumes `approved` to start
-/// execution.
+/// Records human approval of a `plan_ready` mission's plan. Nothing here
+/// starts execution — that's `commands::mission_commands::start_mission`
+/// (M9), a separate, explicit action the user takes once approved.
 pub fn mark_approved(conn: &Connection, id: &str) -> AppResult<()> {
     let now = Utc::now().to_rfc3339();
     conn.execute("UPDATE missions SET status = 'approved', approved_at = ?2 WHERE id = ?1", params![id, now])?;
+    Ok(())
+}
+
+/// M9: transitions an `approved` mission to `running` — the very first
+/// thing `orchestrator::scheduler::run_mission` does, mirroring
+/// `agent_runs::mark_running`'s "the driver itself stamps this, not the
+/// start command" shape.
+pub fn mark_running(conn: &Connection, id: &str) -> AppResult<()> {
+    conn.execute("UPDATE missions SET status = 'running' WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+/// M9: every task in the mission's plan reached `done` — the only path to
+/// this status; any other outcome is `mark_failed` (some task
+/// failed/blocked) or `mark_stopped` (the user cancelled mid-flight).
+pub fn mark_completed(conn: &Connection, id: &str) -> AppResult<()> {
+    let now = Utc::now().to_rfc3339();
+    conn.execute("UPDATE missions SET status = 'completed', completed_at = ?2 WHERE id = ?1", params![id, now])?;
+    Ok(())
+}
+
+/// M9: `stop_mission` was called while this mission was running. Distinct
+/// from `mark_failed` — a stopped mission isn't a failure, it's the user
+/// choosing not to continue.
+pub fn mark_stopped(conn: &Connection, id: &str) -> AppResult<()> {
+    let now = Utc::now().to_rfc3339();
+    conn.execute("UPDATE missions SET status = 'stopped', completed_at = ?2 WHERE id = ?1", params![id, now])?;
     Ok(())
 }
 
@@ -165,6 +201,50 @@ mod tests {
         let fetched = get_by_id(&conn, &mission.id).expect("get_by_id").expect("exists");
         assert_eq!(fetched.status, MissionStatus::Approved);
         assert!(fetched.approved_at.is_some());
+    }
+
+    #[test]
+    fn mark_running_then_mark_completed_round_trips() {
+        let conn = setup_conn();
+        let mission = insert(&conn, "p1", "Add dark mode").expect("insert");
+        mark_plan_ready(&conn, &mission.id, "{\"tasks\":[]}").expect("mark_plan_ready");
+        mark_approved(&conn, &mission.id).expect("mark_approved");
+
+        mark_running(&conn, &mission.id).expect("mark_running");
+        let running = get_by_id(&conn, &mission.id).expect("get_by_id").expect("exists");
+        assert_eq!(running.status, MissionStatus::Running);
+
+        mark_completed(&conn, &mission.id).expect("mark_completed");
+        let completed = get_by_id(&conn, &mission.id).expect("get_by_id").expect("exists");
+        assert_eq!(completed.status, MissionStatus::Completed);
+        assert!(completed.completed_at.is_some());
+    }
+
+    #[test]
+    fn mark_stopped_is_distinct_from_failed() {
+        let conn = setup_conn();
+        let mission = insert(&conn, "p1", "Add dark mode").expect("insert");
+        mark_running(&conn, &mission.id).expect("mark_running");
+
+        mark_stopped(&conn, &mission.id).expect("mark_stopped");
+
+        let fetched = get_by_id(&conn, &mission.id).expect("get_by_id").expect("exists");
+        assert_eq!(fetched.status, MissionStatus::Stopped);
+        assert!(fetched.completed_at.is_some());
+        assert!(fetched.error_message.is_none(), "a user-requested stop is not an error");
+    }
+
+    #[test]
+    fn mark_failed_stamps_completed_at() {
+        let conn = setup_conn();
+        let mission = insert(&conn, "p1", "Add dark mode").expect("insert");
+        mark_running(&conn, &mission.id).expect("mark_running");
+
+        mark_failed(&conn, &mission.id, "2 of 3 tasks completed; 1 blocked").expect("mark_failed");
+
+        let fetched = get_by_id(&conn, &mission.id).expect("get_by_id").expect("exists");
+        assert_eq!(fetched.status, MissionStatus::Failed);
+        assert!(fetched.completed_at.is_some());
     }
 
     #[test]
