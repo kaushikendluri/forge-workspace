@@ -112,13 +112,18 @@ pub fn list_for_project(conn: &Connection, project_id: &str, kind: Option<TestRu
             let mut stmt = conn.prepare(&format!(
                 "SELECT {SELECT_COLUMNS} FROM test_runs WHERE project_id = ?1 AND kind = ?2 ORDER BY started_at DESC, rowid DESC LIMIT 50"
             ))?;
-            stmt.query_map(params![project_id, kind_str(kind)], row_to_test_run)?.collect::<Result<Vec<_>, _>>()?
+            // Bound to `result` (rather than left as the block's tail
+            // expression) so the `?`-desugared temporary borrowing `stmt`
+            // is dropped before `stmt` itself is — see rustc E0597.
+            let result = stmt.query_map(params![project_id, kind_str(kind)], row_to_test_run)?.collect::<Result<Vec<_>, _>>()?;
+            result
         }
         None => {
             let mut stmt = conn.prepare(&format!(
                 "SELECT {SELECT_COLUMNS} FROM test_runs WHERE project_id = ?1 ORDER BY started_at DESC, rowid DESC LIMIT 50"
             ))?;
-            stmt.query_map(params![project_id], row_to_test_run)?.collect::<Result<Vec<_>, _>>()?
+            let result = stmt.query_map(params![project_id], row_to_test_run)?.collect::<Result<Vec<_>, _>>()?;
+            result
         }
     };
     Ok(rows)
