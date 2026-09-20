@@ -13,5 +13,6 @@ pub mod projects;
 pub mod repositories;
 pub mod settings;
 pub mod tasks;
+pub mod test_runs;
 pub mod tool_calls;
 pub mod workspaces;

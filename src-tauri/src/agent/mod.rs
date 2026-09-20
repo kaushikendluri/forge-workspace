@@ -9,6 +9,7 @@
 //! - `anthropic_client` — the Messages API HTTP/SSE client
 //! - `schema`           — the agent-facing tool definitions (JSON Schema)
 //! - `path_guard`        — the workspace-escape guard every filesystem tool uses
+//! - `process`           — shared child-process spawn/timeout/cancel, used by `tools` and (M12) `commands::testing_commands`
 //! - `tools`             — dispatch for each tool by name
 //! - `executor`          — runs one `tool_use` block, persisting/emitting its lifecycle
 //! - `events`            — typed event-emission helpers shared by the loop and executor
@@ -18,6 +19,7 @@ pub mod anthropic_client;
 pub mod events;
 pub mod executor;
 pub mod path_guard;
+pub mod process;
 pub mod schema;
 pub mod tool_loop;
 pub mod tools;

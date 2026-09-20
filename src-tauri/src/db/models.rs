@@ -313,6 +313,42 @@ pub enum NotificationType {
     AgentStopped,
 }
 
+/// M12: which configured command a `TestRun` is for — matches the
+/// `project.<project_id>.<kind>_command` setting key's `<kind>` part
+/// (`project_detect::project_setting_key`) one-to-one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestRunKind {
+    Test,
+    Lint,
+    Build,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestRunStatus {
+    Running,
+    Success,
+    Failure,
+}
+
+/// M12: one manually-triggered run of a project's configured test/lint/build
+/// command (`commands::testing_commands::run_test_suite`), independent of
+/// any agent run — the Testing tab's history list is built from these.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestRun {
+    pub id: String,
+    pub project_id: String,
+    pub kind: TestRunKind,
+    pub command: String,
+    pub status: TestRunStatus,
+    pub output: Option<String>,
+    pub exit_code: Option<i64>,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Notification {

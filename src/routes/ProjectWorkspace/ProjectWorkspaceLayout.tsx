@@ -8,6 +8,7 @@ const tabs = [
   { label: "Files", to: "files" },
   { label: "Changes", to: "changes" },
   { label: "Terminal", to: "terminal" },
+  { label: "Testing", to: "testing" },
 ];
 
 /**

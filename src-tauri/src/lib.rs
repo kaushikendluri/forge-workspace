@@ -7,6 +7,7 @@
 //! - `db`       — SQLite pool, migrations, row models, per-table repositories
 //! - `os_adapter` — platform-specific shell/PATH/env behavior
 //! - `git`      — git CLI wrapper (worktrees, status, diff)
+//! - `project_detect` — M12: detects default test/lint/build commands from a repo's own files
 //! - `orchestrator` — mission planning (M8: objective -> structured, human-approved task plan) and
 //!   execution (M9: the scheduler walks an approved mission's task graph and runs it)
 //! - `terminal` — PTY-backed terminal sessions
@@ -23,6 +24,7 @@ pub mod events;
 pub mod git;
 pub mod orchestrator;
 pub mod os_adapter;
+pub mod project_detect;
 pub mod secrets;
 pub mod state;
 pub mod terminal;
@@ -112,6 +114,10 @@ pub fn run() {
             commands::mission_commands::list_agent_messages,
             commands::mission_commands::start_mission,
             commands::mission_commands::stop_mission,
+            commands::testing_commands::get_project_command_settings,
+            commands::testing_commands::set_project_command_setting,
+            commands::testing_commands::run_test_suite,
+            commands::testing_commands::list_test_runs,
         ])
         .run(tauri::generate_context!())
         .expect("error while running forge-workspace");
