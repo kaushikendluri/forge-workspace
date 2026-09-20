@@ -108,6 +108,8 @@ pub fn run() {
             commands::mission_commands::get_mission,
             commands::mission_commands::list_missions,
             commands::mission_commands::list_mission_tasks,
+            commands::mission_commands::list_mission_board,
+            commands::mission_commands::list_agent_messages,
             commands::mission_commands::start_mission,
             commands::mission_commands::stop_mission,
         ])

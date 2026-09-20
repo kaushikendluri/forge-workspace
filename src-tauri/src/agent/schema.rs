@@ -151,6 +151,38 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
     ]
 }
 
+/// M11: agent-to-agent structured messaging. Deliberately **not** included
+/// in [`all_tool_definitions`] — it's only meaningful when a run is
+/// executing as part of a mission, so `agent::tool_loop::run_agent_loop_inner`
+/// appends this to the model's tool list itself, only for a run whose
+/// `ToolContext::mission_context` is `Some`. A solo M6 run (started directly
+/// from the Agents page) never sees it offered at all. `agent::tools::
+/// dispatch_tool`'s `"send_message"` branch is still defensive about being
+/// called without mission context anyway (a clear tool-result error, not a
+/// crash), in case that ever changes.
+pub fn send_message_tool_definition() -> ToolDefinition {
+    tool(
+        "send_message",
+        "Send a structured message to another task's agent in this mission, or broadcast to the whole \
+         mission by omitting `to_task_title`. This is a persisted mission-level communication log, not a \
+         live chat — the recipient task may not have started yet, or may have already finished, and the \
+         message is still recorded either way. Only available when this run is executing as part of a \
+         mission.",
+        json!({
+            "type": "object",
+            "properties": {
+                "subject": { "type": "string", "description": "A short subject line for the message." },
+                "body": { "type": "string", "description": "The message body." },
+                "to_task_title": {
+                    "type": "string",
+                    "description": "The exact title of another task in this mission to address the message to. Omit to broadcast to every task in the mission.",
+                },
+            },
+            "required": ["subject", "body"],
+        }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,5 +198,19 @@ mod tests {
         }
         assert!(names.contains("report_completion"));
         assert!(names.contains("run_command"));
+        assert!(
+            !names.contains("send_message"),
+            "send_message must not be unconditionally offered — only mission-context runs should see it \
+             (agent::tool_loop appends it itself)"
+        );
+    }
+
+    #[test]
+    fn send_message_tool_definition_is_well_formed_and_distinct() {
+        let def = send_message_tool_definition();
+        assert_eq!(def.name, "send_message");
+        assert_eq!(def.input_schema.get("type").and_then(|v| v.as_str()), Some("object"));
+        assert!(!def.description.is_empty());
+        assert!(!all_tool_definitions().iter().any(|d| d.name == def.name));
     }
 }

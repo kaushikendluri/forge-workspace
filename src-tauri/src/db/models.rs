@@ -266,6 +266,25 @@ pub struct Mission {
     pub completed_at: Option<String>,
 }
 
+/// M11: one agent-to-agent structured message within a mission, written by
+/// the `send_message` tool (`agent::tools`) and read back by
+/// `list_agent_messages` for Mission Control's messages panel and
+/// `AgentDetail.tsx`'s activity stream. `to_agent_run_id` is `None` for a
+/// mission-wide broadcast (no `to_task_title` given, or that task hasn't run
+/// yet) — this is a persisted log, not a live chat, so it may also point at
+/// a run that has already finished by the time it's read.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentMessage {
+    pub id: String,
+    pub from_agent_run_id: String,
+    pub to_agent_run_id: Option<String>,
+    pub mission_id: String,
+    pub subject: String,
+    pub body: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelConfig {

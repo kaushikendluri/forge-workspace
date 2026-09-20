@@ -20,19 +20,20 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use rusqlite::Connection;
+use serde::Serialize;
 use tauri::{AppHandle, Manager};
 use tokio_util::sync::CancellationToken;
 
 use crate::commands::run_blocking;
-use crate::db::models::{Mission, MissionStatus, Task, TaskPriority};
+use crate::db::models::{AgentMessage, Mission, MissionStatus, Task, TaskPriority};
 use crate::db::repository::{
-    missions as missions_repo, model_configs as model_configs_repo, repositories as repositories_repo,
-    tasks as tasks_repo,
+    agent_messages as agent_messages_repo, missions as missions_repo, model_configs as model_configs_repo,
+    repositories as repositories_repo, tasks as tasks_repo,
 };
 use crate::error::{AppError, AppResult};
 use crate::git::{GitCliService, GitService};
 use crate::orchestrator::planner::{self, MissionPlan};
-use crate::orchestrator::scheduler;
+use crate::orchestrator::scheduler::{self, BoardColumn};
 use crate::os_adapter;
 use crate::secrets;
 use crate::state::AppState;
@@ -248,6 +249,57 @@ pub async fn list_mission_tasks(app: AppHandle, mission_id: String) -> Result<Ve
         let state = app.state::<AppState>();
         let conn = state.db.get()?;
         tasks_repo::list_for_mission(&conn, &mission_id)
+    })
+    .await
+}
+
+/// M11: one row of `Tasks.tsx`'s Kanban board — a real `Task` (every field
+/// `list_mission_tasks` already returns, flattened) plus its derived
+/// `column` (`orchestrator::scheduler::compute_board_columns`). Mirrors
+/// `src/types/db.ts`'s `TaskBoardEntryDto`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskBoardEntryDto {
+    #[serde(flatten)]
+    pub task: Task,
+    pub column: BoardColumn,
+}
+
+/// M11: `mission_id`'s tasks (plan order), each labeled with its derived
+/// board column — the read side `Tasks.tsx`'s Kanban board renders from.
+/// Purely a label on top of the same `tasks` rows `list_mission_tasks`
+/// already returns: nothing here writes anything, and `column` can never
+/// disagree with what the scheduler would actually do next, since it's
+/// computed with the scheduler's own `classify_task` (see
+/// `orchestrator::scheduler::board_column_for_task`'s docs).
+#[tauri::command]
+pub async fn list_mission_board(app: AppHandle, mission_id: String) -> Result<Vec<TaskBoardEntryDto>, String> {
+    run_blocking(move || -> AppResult<Vec<TaskBoardEntryDto>> {
+        let state = app.state::<AppState>();
+        let conn = state.db.get()?;
+        let tasks = tasks_repo::list_for_mission(&conn, &mission_id)?;
+        let columns = scheduler::compute_board_columns(&tasks);
+        Ok(tasks
+            .into_iter()
+            .map(|t| {
+                let column = columns.get(&t.id).copied().unwrap_or(BoardColumn::Backlog);
+                TaskBoardEntryDto { task: t, column }
+            })
+            .collect())
+    })
+    .await
+}
+
+/// M11: the full agent-to-agent message log for `mission_id`, oldest first
+/// — the `send_message` tool (`agent::tools`) is the only thing that writes
+/// to this table; this is the read side for Mission Control's messages
+/// panel.
+#[tauri::command]
+pub async fn list_agent_messages(app: AppHandle, mission_id: String) -> Result<Vec<AgentMessage>, String> {
+    run_blocking(move || -> AppResult<Vec<AgentMessage>> {
+        let state = app.state::<AppState>();
+        let conn = state.db.get()?;
+        agent_messages_repo::list_for_mission(&conn, &mission_id)
     })
     .await
 }

@@ -12,6 +12,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   ActivityEvent,
   Agent,
+  AgentMessage,
   AgentRun,
   AgentRunFileDiffDto,
   BranchInfo,
@@ -27,6 +28,7 @@ import type {
   ProjectDto,
   Repository,
   Task,
+  TaskBoardEntryDto,
   ToolCall,
   Workspace,
 } from "@/types/db";
@@ -80,6 +82,8 @@ export interface CommandMap {
   get_mission: { args: { missionId: string }; result: Mission };
   list_missions: { args: { projectId: string }; result: Mission[] };
   list_mission_tasks: { args: { missionId: string }; result: Task[] };
+  list_mission_board: { args: { missionId: string }; result: TaskBoardEntryDto[] };
+  list_agent_messages: { args: { missionId: string }; result: AgentMessage[] };
   start_mission: { args: { missionId: string }; result: void };
   stop_mission: { args: { missionId: string }; result: void };
 }
@@ -253,6 +257,21 @@ export async function listMissions(projectId: string): Promise<Mission[]> {
 /** The tasks `missionId`'s plan proposed, in plan order. */
 export async function listMissionTasks(missionId: string): Promise<Task[]> {
   return invokeCommand("list_mission_tasks", { missionId });
+}
+
+/**
+ * M11: `missionId`'s tasks, each labeled with its derived Kanban board
+ * column (backend-computed from the scheduler's own dependency-graph
+ * readiness logic — see `orchestrator::scheduler::compute_board_columns`).
+ * The board `Tasks.tsx` renders is built from this, not `listMissionTasks`.
+ */
+export async function listMissionBoard(missionId: string): Promise<TaskBoardEntryDto[]> {
+  return invokeCommand("list_mission_board", { missionId });
+}
+
+/** M11: the full agent-to-agent message log for `missionId`, oldest first. */
+export async function listAgentMessages(missionId: string): Promise<AgentMessage[]> {
+  return invokeCommand("list_agent_messages", { missionId });
 }
 
 /**

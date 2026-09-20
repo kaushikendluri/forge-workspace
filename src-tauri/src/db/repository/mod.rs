@@ -3,6 +3,7 @@
 //! alongside the commands that need them (M2+).
 
 pub mod activity_events;
+pub mod agent_messages;
 pub mod agent_runs;
 pub mod agents;
 pub mod missions;
