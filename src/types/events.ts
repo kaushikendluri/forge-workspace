@@ -9,7 +9,9 @@ import type {
   ActivityEvent,
   AgentRunStatus,
   AgentStatus,
+  MissionStatus,
   Notification,
+  TaskStatus,
   ToolCall,
 } from "./db";
 
@@ -45,6 +47,25 @@ export interface NotificationCreatedEvent {
   notification: Notification;
 }
 
+/** M9: a mission-level status transition, emitted by `orchestrator::scheduler::run_mission`. */
+export interface MissionStatusChangedEvent {
+  missionId: string;
+  status: MissionStatus;
+}
+
+/**
+ * M9: one task belonging to a running mission changed status. `reason` is
+ * only set when the scheduler itself determined *why* (a dependency cycle,
+ * or a failed upstream dependency) — it isn't persisted on the `tasks` row,
+ * just surfaced live, so it should be treated as ephemeral (gone on reload).
+ */
+export interface MissionTaskUpdatedEvent {
+  missionId: string;
+  taskId: string;
+  status: TaskStatus;
+  reason: string | null;
+}
+
 export interface TerminalOutputEvent {
   terminalId: string;
   chunk: string;
@@ -63,6 +84,8 @@ export interface ForgeEventMap {
   "agent-run:tool-call-updated": ToolCallUpdatedEvent;
   "agent-run:message-delta": AgentRunMessageDeltaEvent;
   "notification:created": NotificationCreatedEvent;
+  "mission:status-changed": MissionStatusChangedEvent;
+  "mission:task-updated": MissionTaskUpdatedEvent;
   "terminal:output": TerminalOutputEvent;
   "terminal:exit": TerminalExitEvent;
 }

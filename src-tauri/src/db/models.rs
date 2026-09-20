@@ -176,6 +176,18 @@ pub enum TaskStatus {
     Todo,
     InProgress,
     Done,
+    /// M9: this task's agent run ended without succeeding, for a reason
+    /// other than the mission itself being stopped (the agent gave up, hit
+    /// max iterations, or a genuine error) — terminal.
+    Failed,
+    /// M9: permanently unable to run — its `depends_on_task_id` task ended
+    /// `Failed`/`Blocked`/`Cancelled` instead of `Done`, or it's part of a
+    /// dependency cycle (see `orchestrator::scheduler`). Terminal.
+    Blocked,
+    /// M9: the mission was stopped (`stop_mission`) before this task got a
+    /// chance to run — distinct from `Failed`/`Blocked` since nothing about
+    /// this task itself went wrong. Terminal.
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,13 +234,18 @@ pub enum MissionStatus {
     Running,
     Completed,
     Failed,
+    /// M9: `stop_mission` was called while this mission was running —
+    /// distinct from `Failed` (nothing necessarily went wrong; the user
+    /// chose to stop) and `Completed` (not every task ran).
+    Stopped,
 }
 
 /// A mission (M8): a plain-English objective, turned into a structured task
 /// plan by one Anthropic Messages API call (`orchestrator::planner`), which
-/// the user reviews and approves before anything executes. Execution of an
-/// `approved` mission is future work (M9) — nothing in this milestone
-/// advances a mission past `approved`.
+/// the user reviews and approves before anything executes. M9's
+/// `orchestrator::scheduler` walks an `approved` mission's task graph and
+/// runs each task through the real M5/M6 agent pipeline, moving the mission
+/// to `Running`, then `Completed`/`Failed`/`Stopped`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Mission {

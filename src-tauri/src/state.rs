@@ -24,6 +24,15 @@ pub struct AppState {
     /// `agent::tool_loop::ActiveRunGuard`). A run absent from this map is
     /// simply not currently executing — not an error condition.
     pub active_runs: Mutex<HashMap<String, CancellationToken>>,
+    /// Cancellation tokens for every mission currently being executed by
+    /// `orchestrator::scheduler::run_mission`, keyed by `missions.id` — the
+    /// same shape as `active_runs`, one level up. `start_mission` inserts an
+    /// entry before spawning the scheduler loop; `stop_mission` looks the
+    /// token up and fires it (the scheduler observes it between tasks, and
+    /// forwards it as a real `stop_agent_run` call against whichever task's
+    /// run is currently active); the scheduler removes its own entry on
+    /// every exit path.
+    pub active_missions: Mutex<HashMap<String, CancellationToken>>,
 }
 
 impl AppState {
@@ -38,6 +47,7 @@ impl AppState {
             git_service,
             terminals: TerminalManager::new(),
             active_runs: Mutex::new(HashMap::new()),
+            active_missions: Mutex::new(HashMap::new()),
         }
     }
 }

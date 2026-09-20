@@ -80,6 +80,8 @@ export interface CommandMap {
   get_mission: { args: { missionId: string }; result: Mission };
   list_missions: { args: { projectId: string }; result: Mission[] };
   list_mission_tasks: { args: { missionId: string }; result: Task[] };
+  start_mission: { args: { missionId: string }; result: void };
+  stop_mission: { args: { missionId: string }; result: void };
 }
 
 /**
@@ -251,6 +253,22 @@ export async function listMissions(projectId: string): Promise<Mission[]> {
 /** The tasks `missionId`'s plan proposed, in plan order. */
 export async function listMissionTasks(missionId: string): Promise<Task[]> {
   return invokeCommand("list_mission_tasks", { missionId });
+}
+
+/**
+ * Starts real execution of an `approved` mission's plan
+ * (`orchestrator::scheduler::run_mission`): walks the task dependency
+ * graph and runs each task, sequentially, through the real M5/M6 agent
+ * pipeline. Progress arrives entirely through `mission:*` events — this
+ * only kicks the run off. Rejects if `missionId` isn't currently `approved`.
+ */
+export async function startMission(missionId: string): Promise<void> {
+  return invokeCommand("start_mission", { missionId });
+}
+
+/** Cancels a currently-running mission. Errors if `missionId` isn't active. */
+export async function stopMission(missionId: string): Promise<void> {
+  return invokeCommand("stop_mission", { missionId });
 }
 
 /** All agents for `projectId`, most recently created first. */

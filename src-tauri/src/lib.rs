@@ -7,7 +7,8 @@
 //! - `db`       — SQLite pool, migrations, row models, per-table repositories
 //! - `os_adapter` — platform-specific shell/PATH/env behavior
 //! - `git`      — git CLI wrapper (worktrees, status, diff)
-//! - `orchestrator` — mission planning (M8): objective -> structured, human-approved task plan
+//! - `orchestrator` — mission planning (M8: objective -> structured, human-approved task plan) and
+//!   execution (M9: the scheduler walks an approved mission's task graph and runs it)
 //! - `terminal` — PTY-backed terminal sessions
 //! - `secrets`  — OS keychain-backed API key storage
 //! - `events`   — typed event emission helpers
@@ -107,6 +108,8 @@ pub fn run() {
             commands::mission_commands::get_mission,
             commands::mission_commands::list_missions,
             commands::mission_commands::list_mission_tasks,
+            commands::mission_commands::start_mission,
+            commands::mission_commands::stop_mission,
         ])
         .run(tauri::generate_context!())
         .expect("error while running forge-workspace");
