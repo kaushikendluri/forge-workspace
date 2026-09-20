@@ -1,0 +1,11 @@
+-- M10: a persisted default for how many tasks
+-- `orchestrator::scheduler::run_mission` will run concurrently, read via the
+-- `agent.max_parallel_agents` key in the existing M4 `settings` table (see
+-- `db::repository::settings`) — the same key/value store
+-- `agent.max_iterations` etc. already live in, not a new mechanism.
+--
+-- `INSERT OR IGNORE` rather than a bare `INSERT`: this is a seed for a value
+-- that's meant to become user-editable later (a Settings UI writes through
+-- the ordinary `set_setting` command), so if it's ever already present this
+-- migration leaves it alone rather than clobbering a real user edit.
+INSERT OR IGNORE INTO settings (key, value) VALUES ('agent.max_parallel_agents', '3');

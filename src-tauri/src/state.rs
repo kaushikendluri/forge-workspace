@@ -28,10 +28,13 @@ pub struct AppState {
     /// `orchestrator::scheduler::run_mission`, keyed by `missions.id` — the
     /// same shape as `active_runs`, one level up. `start_mission` inserts an
     /// entry before spawning the scheduler loop; `stop_mission` looks the
-    /// token up and fires it (the scheduler observes it between tasks, and
-    /// forwards it as a real `stop_agent_run` call against whichever task's
-    /// run is currently active); the scheduler removes its own entry on
-    /// every exit path.
+    /// token up and fires it. The scheduler (M10) may have several tasks
+    /// running concurrently for one mission (each with its own entry in
+    /// this mission's *own* `active_runs`, not tracked separately here) —
+    /// every one of them holds a `.clone()` of this same token and
+    /// independently forwards it as a real `stop_agent_run` call against its
+    /// own run, so firing this one token here stops all of them, not just
+    /// one. The scheduler removes its own entry on every exit path.
     pub active_missions: Mutex<HashMap<String, CancellationToken>>,
 }
 

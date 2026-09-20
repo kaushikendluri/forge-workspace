@@ -98,10 +98,14 @@ function TaskRunLink({ agentRunId, projectId }: { agentRunId: string; projectId:
  * (`list_mission_tasks`) with title/description/suggested agent
  * type/priority/dependency/live status, an Approve action while
  * `plan_ready`, and — once `approved` — a real "Start mission" action that
- * spawns `orchestrator::scheduler::run_mission` (M9). While `running`, task
- * statuses update live from `mission:task-updated` events and a Stop action
- * cancels the mission; a terminal task's agent run links to the real
- * `AgentDetail` page.
+ * spawns `orchestrator::scheduler::run_mission` (M9; M10 made it run ready
+ * tasks concurrently). While `running`, task statuses update live from
+ * `mission:task-updated` events — every task in `tasks` renders its own
+ * independent status badge, so 2+ tasks showing `Running` at once (M10)
+ * "just works" the same way a single one did under M9, with no singular
+ * "the current task" state anywhere in this component — and a Stop action
+ * cancels the mission (all of its currently-running tasks, not just one); a
+ * terminal task's agent run links to the real `AgentDetail` page.
  */
 function MissionPlanCard({
   mission,
@@ -334,7 +338,7 @@ function MissionPlanCard({
           </Button>
           <p className="text-[11px] text-subtle-foreground">
             Approved{mission.approvedAt ? ` ${new Date(mission.approvedAt).toLocaleString()}` : ""}. Starting runs
-            each task, in order, through a real agent.
+            ready tasks through real agents concurrently, in dependency order.
           </p>
         </div>
       )}
@@ -345,7 +349,9 @@ function MissionPlanCard({
             <Square className="mr-1.5 h-3.5 w-3.5" />
             {isStopping ? "Stopping…" : "Stop mission"}
           </Button>
-          <p className="text-[11px] text-subtle-foreground">Tasks run one at a time, in dependency order.</p>
+          <p className="text-[11px] text-subtle-foreground">
+            Ready tasks run concurrently, up to the configured limit, in dependency order.
+          </p>
         </div>
       )}
 
@@ -369,10 +375,12 @@ function MissionPlanCard({
  * sent to `create_mission`, which makes one real Anthropic call
  * (`orchestrator::planner`, forced structured tool output — not the M6
  * multi-turn agent loop) and returns a structured plan as real `tasks`
- * rows. The user reviews the plan, approves it, and — as of M9 — can start
- * real execution: `orchestrator::scheduler::run_mission` walks the task
- * dependency graph and runs each task, sequentially, through the real M5/M6
- * agent pipeline, with live status and a Stop action.
+ * rows. The user reviews the plan, approves it, and can start real
+ * execution: `orchestrator::scheduler::run_mission` walks the task
+ * dependency graph and runs ready tasks concurrently (M10; bounded by the
+ * `agent.max_parallel_agents` setting) through the real M5/M6 agent
+ * pipeline, promoting dependent tasks as soon as what they depend on
+ * finishes, with live status and a Stop action.
  */
 export function Tasks() {
   const activeProjectId = useProjectStore((s) => s.activeProjectId);
@@ -447,7 +455,8 @@ export function Tasks() {
       <p className="max-w-2xl text-xs text-muted-foreground">
         Give <span className="font-medium text-foreground">{activeProject.name}</span> a plain-English objective and
         a real Anthropic call breaks it into a task plan for you to review below. Once approved, starting the
-        mission runs each task through a real agent, one at a time, in dependency order.
+        mission runs ready tasks through real agents concurrently (each in its own isolated git worktree, bounded by
+        a configurable limit), promoting dependent tasks as soon as what they depend on finishes.
       </p>
 
       <div className="flex flex-col gap-2">

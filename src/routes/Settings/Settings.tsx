@@ -6,7 +6,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Separator } from "@/components/ui/separator";
-import { isTauriRuntime, listModelConfigs } from "@/lib/tauri";
+import { getSetting, isTauriRuntime, listModelConfigs, setSetting } from "@/lib/tauri";
 import type { ModelConfig } from "@/types/db";
 
 function SettingsSection({
@@ -166,6 +166,100 @@ function ModelConfigSection() {
   );
 }
 
+/** The `settings` key M10's scheduler reads via `agent.max_parallel_agents` — see `orchestrator::scheduler`. */
+const MAX_PARALLEL_AGENTS_KEY = "agent.max_parallel_agents";
+/** Mirrors `orchestrator::scheduler::DEFAULT_MAX_PARALLEL_AGENTS` — used only if the value can't be read/parsed. */
+const DEFAULT_MAX_PARALLEL_AGENTS = 3;
+
+/**
+ * M10: a real, backend-persisted setting (seeded to `3` by migration
+ * `0004_max_parallel_agents.sql`, read once per mission start by
+ * `orchestrator::scheduler::run_mission_inner`) controlling how many of a
+ * running mission's ready tasks execute concurrently. Reads/writes through
+ * the same generic `get_setting`/`set_setting` commands every other setting
+ * in this app goes through — no new backend mechanism, just a new key.
+ */
+function MaxParallelAgentsSection() {
+  const [savedValue, setSavedValue] = useState<number | null>(null);
+  const [input, setInput] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!isTauriRuntime()) {
+      setSavedValue(DEFAULT_MAX_PARALLEL_AGENTS);
+      setInput(String(DEFAULT_MAX_PARALLEL_AGENTS));
+      return;
+    }
+    getSetting(MAX_PARALLEL_AGENTS_KEY)
+      .then((raw) => {
+        const parsed = raw !== null ? Number.parseInt(raw, 10) : NaN;
+        const resolved = Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_PARALLEL_AGENTS;
+        setSavedValue(resolved);
+        setInput(String(resolved));
+      })
+      .catch(() => {
+        setSavedValue(DEFAULT_MAX_PARALLEL_AGENTS);
+        setInput(String(DEFAULT_MAX_PARALLEL_AGENTS));
+      });
+  }, []);
+
+  const handleSave = async () => {
+    const parsed = Number.parseInt(input, 10);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      setError("Enter a whole number greater than 0.");
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    try {
+      await setSetting(MAX_PARALLEL_AGENTS_KEY, String(parsed));
+      setSavedValue(parsed);
+      setInput(String(parsed));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (!isTauriRuntime()) {
+    return <p className="text-xs text-muted-foreground">Execution settings require the desktop app runtime.</p>;
+  }
+
+  if (savedValue === null) {
+    return <p className="text-xs text-muted-foreground">Loading…</p>;
+  }
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex items-center gap-2">
+        <Input
+          type="number"
+          min={1}
+          step={1}
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          className="max-w-[6rem]"
+        />
+        <Button
+          size="sm"
+          onClick={() => void handleSave()}
+          disabled={saving || input.trim() === String(savedValue)}
+        >
+          {saving ? "Saving…" : "Save"}
+        </Button>
+        <span className="text-xs text-muted-foreground">Currently {savedValue}</span>
+      </div>
+      <p className="text-xs text-muted-foreground">
+        How many tasks a running mission (Tasks tab) executes at once, each in its own isolated git worktree. Takes
+        effect the next time a mission is started — it doesn't change one already running.
+      </p>
+      {error && <p className="text-xs text-destructive">{error}</p>}
+    </div>
+  );
+}
+
 export function Settings() {
   const theme = useSettingsStore((s) => s.theme);
   const setTheme = useSettingsStore((s) => s.setTheme);
@@ -212,6 +306,15 @@ export function Settings() {
         description="Choose default models and output limits for agent runs."
       >
         <ModelConfigSection />
+      </SettingsSection>
+
+      <Separator />
+
+      <SettingsSection
+        title="Execution"
+        description="Controls how missions (Tasks tab) run their tasks."
+      >
+        <MaxParallelAgentsSection />
       </SettingsSection>
     </div>
   );
