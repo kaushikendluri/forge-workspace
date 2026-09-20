@@ -10,7 +10,6 @@
 //! of producing a normal tool result.
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -23,6 +22,7 @@ use crate::git::GitService;
 use crate::os_adapter::OperatingSystemAdapter;
 
 use super::path_guard::resolve_in_workspace;
+use super::process;
 
 /// M11: set on `ToolContext` only when this run is executing as part of a
 /// mission (the scheduler started it for a specific mission task, via
@@ -397,60 +397,39 @@ fn search_code(ctx: &ToolContext<'_>, input: &Value) -> ToolRunOutcome {
 }
 
 // ---------------------------------------------------------------------
-// Shell execution — timeout + cancellation via `tokio::process`, whose
-// `kill_on_drop(true)` means dropping the in-flight future (which
-// `tokio::select!` does for whichever branch loses) kills the child process,
-// rather than leaving it to run in the background.
+// Shell execution — the actual spawn/timeout/cancel dance lives in
+// `agent::process` (shared with M12's `commands::testing_commands`); this
+// just formats that outcome into a `ToolRunOutcome` the model sees.
 // ---------------------------------------------------------------------
 
 async fn run_shell(ctx: &ToolContext<'_>, command: &str) -> ToolRunOutcome {
-    let argv = ctx.os_adapter.one_shot_shell_invocation(command);
-    let Some((program, args)) = argv.split_first() else {
-        return err("no shell configured for this platform".to_string());
-    };
-
-    let mut cmd = tokio::process::Command::new(program);
-    cmd.args(args);
-    cmd.current_dir(&ctx.workspace_root);
-    cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-    cmd.kill_on_drop(true);
-
-    let child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => return err(format!("failed to run command: {e}")),
-    };
-
-    let output_fut = child.wait_with_output();
-    tokio::select! {
-        biased;
-        _ = ctx.cancel.cancelled() => {
-            // `output_fut` owns the `Child`; dropping this branch's future
-            // drops the `Child`, and `kill_on_drop(true)` kills the real OS
-            // process rather than abandoning it.
+    let outcome = process::run_shell_command(ctx.os_adapter, &ctx.workspace_root, command, ctx.tool_timeout, ctx.cancel.clone()).await;
+    match outcome {
+        process::ProcessOutcome::Cancelled => {
+            // `run_shell_command` owns the `Child` until it returns; by the
+            // time this branch runs, `kill_on_drop(true)` has already killed
+            // the real OS process rather than abandoning it.
             err("command cancelled: the agent run was stopped".to_string())
         }
-        _ = tokio::time::sleep(ctx.tool_timeout) => {
-            err(format!("command timed out after {}ms and was killed", ctx.tool_timeout.as_millis()))
+        process::ProcessOutcome::TimedOut { timeout_ms } => {
+            err(format!("command timed out after {timeout_ms}ms and was killed"))
         }
-        result = output_fut => {
-            match result {
-                Ok(output) => {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    let exit_code = output.status.code();
-                    let mut text = format!("exit code: {}\n", exit_code.map(|c| c.to_string()).unwrap_or_else(|| "unknown (terminated by signal)".to_string()));
-                    if !stdout.is_empty() {
-                        text.push_str(&format!("stdout:\n{stdout}\n"));
-                    }
-                    if !stderr.is_empty() {
-                        text.push_str(&format!("stderr:\n{stderr}\n"));
-                    }
-                    let succeeded = output.status.success();
-                    if succeeded { ok(text) } else { err(text) }
-                }
-                Err(e) => err(format!("failed to run command: {e}")),
+        process::ProcessOutcome::SpawnFailed(message) => err(message),
+        process::ProcessOutcome::Finished { stdout, stderr, exit_code, success } => {
+            let mut text = format!(
+                "exit code: {}\n",
+                exit_code.map(|c| c.to_string()).unwrap_or_else(|| "unknown (terminated by signal)".to_string())
+            );
+            if !stdout.is_empty() {
+                text.push_str(&format!("stdout:\n{stdout}\n"));
+            }
+            if !stderr.is_empty() {
+                text.push_str(&format!("stderr:\n{stderr}\n"));
+            }
+            if success {
+                ok(text)
+            } else {
+                err(text)
             }
         }
     }
@@ -468,7 +447,8 @@ async fn run_configured_command(ctx: &ToolContext<'_>, configured: Option<String
     match configured {
         Some(command) if !command.trim().is_empty() => run_shell(ctx, &command).await,
         _ => err(format!(
-            "no {kind} command configured for this project — set the `project.{kind}_command` setting first"
+            "no {kind} command configured for this project — set it in the project's Testing tab (or the \
+             matching `project.<id>.{kind}_command` setting) first"
         )),
     }
 }

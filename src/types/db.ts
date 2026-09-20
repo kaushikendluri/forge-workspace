@@ -342,3 +342,48 @@ export interface AgentMessage {
   body: string;
   createdAt: IsoDateTime;
 }
+
+/**
+ * M12: which configured command a `TestRun` is for — matches the
+ * `project.<projectId>.<kind>_command` setting key's `<kind>` part.
+ */
+export type TestRunKind = "test" | "lint" | "build";
+export type TestRunStatus = "running" | "success" | "failure";
+
+/**
+ * M12: one manually-triggered run of a project's configured test/lint/build
+ * command, independent of any agent run. Mirrors
+ * `src-tauri/src/db/models.rs`'s `TestRun`. Returned by `run_test_suite` and
+ * `list_test_runs` — the Testing tab's history is built from these.
+ */
+export interface TestRun {
+  id: string;
+  projectId: string;
+  kind: TestRunKind;
+  command: string;
+  status: TestRunStatus;
+  output: string | null;
+  exitCode: number | null;
+  startedAt: IsoDateTime;
+  completedAt: IsoDateTime | null;
+}
+
+/**
+ * M12: one configured command's value plus its provenance — `"detected"`
+ * (pre-filled by `project_detect::detect_commands` when the project was
+ * opened/created and nothing was configured yet), `"user"` (typed into the
+ * Testing tab), or `null` (never configured, or configured before M12 with
+ * no recorded source). Mirrors
+ * `src-tauri/src/commands/testing_commands.rs`'s `CommandSettingDto`.
+ */
+export interface CommandSettingDto {
+  value: string | null;
+  source: "detected" | "user" | null;
+}
+
+/** Mirrors `src-tauri/src/commands/testing_commands.rs`'s `ProjectCommandSettingsDto`. */
+export interface ProjectCommandSettingsDto {
+  testCommand: CommandSettingDto;
+  lintCommand: CommandSettingDto;
+  buildCommand: CommandSettingDto;
+}

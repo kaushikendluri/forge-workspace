@@ -136,9 +136,17 @@ fn load_run_setup(conn: &Connection, agent_run_id: &str) -> AppResult<RunSetup> 
         .and_then(|s| s.value.parse::<u64>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(DEFAULT_TOOL_TIMEOUT_MS);
-    let test_command = non_empty(settings_repo::get(conn, "project.test_command")?.map(|s| s.value));
-    let lint_command = non_empty(settings_repo::get(conn, "project.lint_command")?.map(|s| s.value));
-    let build_command = non_empty(settings_repo::get(conn, "project.build_command")?.map(|s| s.value));
+    // M12: these live per-project (`project.<project_id>.<kind>_command`),
+    // not as one global setting — see `project_detect::project_setting_key`,
+    // which `commands::project_commands::open_or_register` also uses to
+    // pre-fill them from real detection, and `commands::testing_commands`
+    // uses for the Testing tab's manual runs.
+    let test_command =
+        non_empty(settings_repo::get(conn, &crate::project_detect::project_setting_key(&agent.project_id, "test_command"))?.map(|s| s.value));
+    let lint_command =
+        non_empty(settings_repo::get(conn, &crate::project_detect::project_setting_key(&agent.project_id, "lint_command"))?.map(|s| s.value));
+    let build_command =
+        non_empty(settings_repo::get(conn, &crate::project_detect::project_setting_key(&agent.project_id, "build_command"))?.map(|s| s.value));
 
     let model_max_tokens = model_configs_repo::list(conn)?
         .into_iter()

@@ -25,10 +25,13 @@ import type {
   ModelConfig,
   Notification,
   Project,
+  ProjectCommandSettingsDto,
   ProjectDto,
   Repository,
   Task,
   TaskBoardEntryDto,
+  TestRun,
+  TestRunKind,
   ToolCall,
   Workspace,
 } from "@/types/db";
@@ -86,6 +89,10 @@ export interface CommandMap {
   list_agent_messages: { args: { missionId: string }; result: AgentMessage[] };
   start_mission: { args: { missionId: string }; result: void };
   stop_mission: { args: { missionId: string }; result: void };
+  get_project_command_settings: { args: { projectId: string }; result: ProjectCommandSettingsDto };
+  set_project_command_setting: { args: { projectId: string; kind: TestRunKind; value: string }; result: void };
+  run_test_suite: { args: { projectId: string; kind: TestRunKind }; result: TestRun };
+  list_test_runs: { args: { projectId: string; kind: TestRunKind | null }; result: TestRun[] };
 }
 
 /**
@@ -352,4 +359,32 @@ export async function listActivityEvents(agentRunId: string): Promise<ActivityEv
 /** A real diff of everything currently changed in the run's workspace. */
 export async function getRunDiff(agentRunId: string): Promise<AgentRunFileDiffDto[]> {
   return invokeCommand("get_run_diff", { agentRunId });
+}
+
+/**
+ * M12: `projectId`'s detected/configured test/lint/build commands, each
+ * labeled with whether it was auto-detected, user-set, or never configured.
+ */
+export async function getProjectCommandSettings(projectId: string): Promise<ProjectCommandSettingsDto> {
+  return invokeCommand("get_project_command_settings", { projectId });
+}
+
+/** Sets `projectId`'s `kind` command and marks it as user-configured. */
+export async function setProjectCommandSetting(projectId: string, kind: TestRunKind, value: string): Promise<void> {
+  return invokeCommand("set_project_command_setting", { projectId, kind, value });
+}
+
+/**
+ * Runs `projectId`'s configured `kind` command (in the project's primary
+ * repository root, independent of any agent run) and returns the completed
+ * result. Rejects with a clear message if no command is configured for
+ * `kind` — never guesses one.
+ */
+export async function runTestSuite(projectId: string, kind: TestRunKind): Promise<TestRun> {
+  return invokeCommand("run_test_suite", { projectId, kind });
+}
+
+/** `projectId`'s test/lint/build run history, most recent first, optionally narrowed to one `kind`. */
+export async function listTestRuns(projectId: string, kind: TestRunKind | null = null): Promise<TestRun[]> {
+  return invokeCommand("list_test_runs", { projectId, kind });
 }

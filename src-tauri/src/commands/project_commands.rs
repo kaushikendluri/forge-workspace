@@ -4,13 +4,15 @@
 
 use std::path::{Path, PathBuf};
 
+use rusqlite::Connection;
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 
 use crate::commands::run_blocking;
 use crate::db::models::{Project, Repository, Task};
-use crate::db::repository::{projects as projects_repo, repositories as repositories_repo};
+use crate::db::repository::{projects as projects_repo, repositories as repositories_repo, settings as settings_repo};
 use crate::error::{AppError, AppResult};
+use crate::project_detect::{self, project_setting_key, project_setting_source_key};
 use crate::state::AppState;
 
 /// A project row joined with its (Phase 1: single) repository — the shape
@@ -49,6 +51,32 @@ fn to_dto(project: Project, repository: Repository) -> ProjectDto {
     }
 }
 
+/// M12: runs real command detection (`project_detect::detect_commands`)
+/// against `root` and pre-fills any of `project_id`'s `test_command`/
+/// `lint_command`/`build_command` settings that aren't already set —
+/// never overwrites a value already there, whether that's something the
+/// user configured or something a previous open already detected. Called on
+/// every `open_project`/`init_project`, not just the first time a repository
+/// is registered, so a project opened before this feature existed still
+/// gets pre-filled the next time it's opened.
+fn prefill_detected_commands(conn: &Connection, project_id: &str, root: &Path) -> AppResult<()> {
+    let detected = project_detect::detect_commands(root);
+    for (setting_name, value) in [
+        ("test_command", detected.test_command),
+        ("lint_command", detected.lint_command),
+        ("build_command", detected.build_command),
+    ] {
+        let Some(value) = value else { continue };
+        let value_key = project_setting_key(project_id, setting_name);
+        if settings_repo::get(conn, &value_key)?.is_some() {
+            continue;
+        }
+        settings_repo::set(conn, &value_key, &value)?;
+        settings_repo::set(conn, &project_setting_source_key(project_id, setting_name), "detected")?;
+    }
+    Ok(())
+}
+
 fn folder_name(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -81,6 +109,7 @@ fn open_or_register(state: &AppState, path: &str, explicit_name: Option<&str>) -
 
     if let Some(repository) = repositories_repo::get_by_root_path(&conn, &root_path)? {
         projects_repo::update_last_opened(&conn, &repository.project_id)?;
+        prefill_detected_commands(&conn, &repository.project_id, &canonical)?;
         let project = projects_repo::get_by_id(&conn, &repository.project_id)?.ok_or_else(|| {
             AppError::NotFound(format!("project {} not found", repository.project_id))
         })?;
@@ -101,6 +130,7 @@ fn open_or_register(state: &AppState, path: &str, explicit_name: Option<&str>) -
     let project = projects_repo::insert(&conn, &name, None)?;
     let repository = repositories_repo::insert(&conn, &project.id, &root_path, None, &default_branch)?;
     projects_repo::update_last_opened(&conn, &project.id)?;
+    prefill_detected_commands(&conn, &project.id, &canonical)?;
     let project = projects_repo::get_by_id(&conn, &project.id)?
         .ok_or_else(|| AppError::NotFound("project disappeared right after being created".to_string()))?;
 
@@ -177,4 +207,59 @@ pub fn create_project(
 #[tauri::command]
 pub fn list_tasks(_state: State<AppState>, _project_id: String) -> AppResult<Vec<Task>> {
     todo!("M2+: db::repository::tasks::list_for_project — lands with the Tasks route")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::migrations::run_migrations;
+
+    fn setup_conn() -> Connection {
+        let mut conn = Connection::open_in_memory().expect("open in-memory db");
+        run_migrations(&mut conn).expect("run migrations");
+        conn.execute("INSERT INTO projects (id, name) VALUES ('p1', 'Test Project')", []).expect("insert project");
+        conn
+    }
+
+    #[test]
+    fn prefill_detected_commands_fills_unset_settings_with_source_detected() {
+        let conn = setup_conn();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+
+        prefill_detected_commands(&conn, "p1", dir.path()).expect("prefill");
+
+        let value = settings_repo::get(&conn, &project_setting_key("p1", "test_command")).unwrap().unwrap();
+        assert_eq!(value.value, "cargo test");
+        let source = settings_repo::get(&conn, &project_setting_source_key("p1", "test_command")).unwrap().unwrap();
+        assert_eq!(source.value, "detected");
+    }
+
+    #[test]
+    fn prefill_detected_commands_never_overwrites_an_existing_value() {
+        let conn = setup_conn();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        settings_repo::set(&conn, &project_setting_key("p1", "test_command"), "make test").unwrap();
+        settings_repo::set(&conn, &project_setting_source_key("p1", "test_command"), "user").unwrap();
+
+        prefill_detected_commands(&conn, "p1", dir.path()).expect("prefill");
+
+        let value = settings_repo::get(&conn, &project_setting_key("p1", "test_command")).unwrap().unwrap();
+        assert_eq!(value.value, "make test", "an already-configured command must never be clobbered by detection");
+        let source = settings_repo::get(&conn, &project_setting_source_key("p1", "test_command")).unwrap().unwrap();
+        assert_eq!(source.value, "user");
+    }
+
+    #[test]
+    fn prefill_detected_commands_leaves_unrecognized_projects_untouched() {
+        let conn = setup_conn();
+        let dir = tempfile::tempdir().unwrap();
+
+        prefill_detected_commands(&conn, "p1", dir.path()).expect("prefill");
+
+        assert!(settings_repo::get(&conn, &project_setting_key("p1", "test_command")).unwrap().is_none());
+        assert!(settings_repo::get(&conn, &project_setting_key("p1", "lint_command")).unwrap().is_none());
+        assert!(settings_repo::get(&conn, &project_setting_key("p1", "build_command")).unwrap().is_none());
+    }
 }

@@ -5,6 +5,7 @@ import {
   Bot,
   ChevronsLeft,
   ChevronsRight,
+  FlaskConical,
   Files,
   FolderGit2,
   GitCompare,
@@ -112,6 +113,7 @@ export function Sidebar() {
         { label: "Files", to: `/projects/${activeProjectId}/files`, icon: Files },
         { label: "Changes", to: `/projects/${activeProjectId}/changes`, icon: GitCompare },
         { label: "Terminal", to: `/projects/${activeProjectId}/terminal`, icon: SquareTerminal },
+        { label: "Testing", to: `/projects/${activeProjectId}/testing`, icon: FlaskConical },
       ]
     : [];
 
@@ -121,6 +123,7 @@ export function Sidebar() {
         { label: "Files", icon: Files, reason: "Open a project to enable" },
         { label: "Changes", icon: GitCompare, reason: "Open a project to enable" },
         { label: "Terminal", icon: SquareTerminal, reason: "Open a project to enable" },
+        { label: "Testing", icon: FlaskConical, reason: "Open a project to enable" },
       ];
 
   return (
