@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { ListChecks, Play, Sparkles, Square } from "lucide-react";
 import { EmptyState } from "@/components/empty-states/EmptyState";
@@ -10,13 +10,14 @@ import {
   createMission,
   getAgentRun,
   getMission,
-  listMissionTasks,
+  listAgentMessages,
+  listMissionBoard,
   listMissions,
   startMission,
   stopMission,
 } from "@/lib/tauri";
 import { onForgeEvent } from "@/lib/events";
-import type { Mission, MissionStatus, Task, TaskPriority, TaskStatus } from "@/types/db";
+import type { AgentMessage, BoardColumn, Mission, MissionStatus, TaskBoardEntryDto, TaskPriority, TaskStatus } from "@/types/db";
 
 function errorMessage(err: unknown): string {
   if (typeof err === "string") return err;
@@ -59,6 +60,27 @@ const TASK_STATUS_BADGE: Record<TaskStatus, { label: string; variant: BadgeVaria
 };
 
 /**
+ * M11: the Kanban board's columns, in display order. `column` on each task
+ * is computed backend-side (`list_mission_board` /
+ * `orchestrator::scheduler::compute_board_columns`) from the exact same
+ * dependency-graph logic the scheduler itself uses to decide what to run
+ * next — nothing here re-derives readiness client-side. `review` is never
+ * actually populated yet (no reviewer agent exists before Phase 4); it's
+ * rendered as an honest, always-empty placeholder rather than left out or
+ * faked.
+ */
+const BOARD_COLUMNS: { key: BoardColumn; label: string }[] = [
+  { key: "backlog", label: "Backlog" },
+  { key: "ready", label: "Ready" },
+  { key: "running", label: "Running" },
+  { key: "blocked", label: "Blocked" },
+  { key: "review", label: "Review" },
+  { key: "complete", label: "Complete" },
+  { key: "failed", label: "Failed" },
+  { key: "cancelled", label: "Cancelled" },
+];
+
+/**
  * Resolves `agentRunId` to the agent that owns it and links to the real
  * `AgentDetail` page for it — the same activity feed / tool calls / diff
  * view the Agents flow uses, never a parallel view. `Task` only stores
@@ -94,6 +116,91 @@ function TaskRunLink({ agentRunId, projectId }: { agentRunId: string; projectId:
 }
 
 /**
+ * M11: a mission's real agent-to-agent message log — sender task -> recipient
+ * task (or "whole mission" for a broadcast), subject, body, timestamp. A
+ * structured log view, not a live chat: refetches on every
+ * `mission:task-updated` event (there's no dedicated message-created event)
+ * so it stays reasonably current while a mission is running, without adding
+ * new event plumbing this milestone doesn't otherwise need. `entries` (the
+ * board rows, which carry each task's `agentRunId`) is what turns a raw
+ * `fromAgentRunId`/`toAgentRunId` into a readable task title.
+ */
+function MissionMessagesPanel({ mission, entries }: { mission: Mission; entries: TaskBoardEntryDto[] }) {
+  const [messages, setMessages] = useState<AgentMessage[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const refetch = () => {
+      listAgentMessages(mission.id)
+        .then((result) => {
+          if (!cancelled) setMessages(result);
+        })
+        .catch((err) => {
+          if (!cancelled) setError(errorMessage(err));
+        });
+    };
+
+    refetch();
+    const unlisten: Array<() => void> = [];
+    void (async () => {
+      unlisten.push(
+        await onForgeEvent("mission:task-updated", (payload) => {
+          if (!cancelled && payload.missionId === mission.id) refetch();
+        }),
+      );
+    })();
+
+    return () => {
+      cancelled = true;
+      unlisten.forEach((fn) => fn());
+    };
+  }, [mission.id]);
+
+  const taskTitleByRunId = useMemo(
+    () => new Map(entries.filter((e) => e.agentRunId !== null).map((e) => [e.agentRunId as string, e.title] as const)),
+    [entries],
+  );
+
+  if (error) {
+    return (
+      <div className="rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
+        Couldn't load this mission's messages: {error}
+      </div>
+    );
+  }
+  if (!messages) {
+    return <p className="text-xs text-muted-foreground">Loading messages…</p>;
+  }
+  if (messages.length === 0) {
+    return <p className="text-xs text-muted-foreground">No agent-to-agent messages yet.</p>;
+  }
+
+  return (
+    <div className="flex flex-col gap-1.5">
+      {messages.map((message) => {
+        const from = taskTitleByRunId.get(message.fromAgentRunId) ?? "Unknown task";
+        const to = message.toAgentRunId ? (taskTitleByRunId.get(message.toAgentRunId) ?? "Unknown task") : "Whole mission (broadcast)";
+        return (
+          <div key={message.id} className="rounded border border-border/60 bg-surface px-2 py-1.5 text-xs">
+            <div className="flex items-center justify-between gap-2">
+              <span className="font-medium text-foreground">
+                {from} → {to}
+              </span>
+              <span className="shrink-0 text-[10px] text-subtle-foreground">
+                {new Date(message.createdAt).toLocaleTimeString()}
+              </span>
+            </div>
+            <p className="mt-0.5 font-medium text-foreground">{message.subject}</p>
+            <p className="mt-0.5 whitespace-pre-wrap text-muted-foreground">{message.body}</p>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/**
  * One mission's plan review + live execution card: its real tasks
  * (`list_mission_tasks`) with title/description/suggested agent
  * type/priority/dependency/live status, an Approve action while
@@ -116,7 +223,7 @@ function MissionPlanCard({
   projectId: string;
   onMissionUpdated: (mission: Mission) => void;
 }) {
-  const [tasks, setTasks] = useState<Task[] | null>(null);
+  const [tasks, setTasks] = useState<TaskBoardEntryDto[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [isApproving, setIsApproving] = useState(false);
   const [approveError, setApproveError] = useState<string | null>(null);
@@ -129,7 +236,7 @@ function MissionPlanCard({
   const [blockedReasons, setBlockedReasons] = useState<Record<string, string>>({});
 
   const refetchTasks = () => {
-    listMissionTasks(mission.id)
+    listMissionBoard(mission.id)
       .then((result) => setTasks(result))
       .catch((err) => setLoadError(errorMessage(err)));
   };
@@ -138,7 +245,7 @@ function MissionPlanCard({
     let cancelled = false;
     setTasks(null);
     setLoadError(null);
-    listMissionTasks(mission.id)
+    listMissionBoard(mission.id)
       .then((result) => {
         if (!cancelled) setTasks(result);
       })
@@ -282,40 +389,66 @@ function MissionPlanCard({
       )}
 
       {tasks && tasks.length > 0 && (
-        <div className="flex flex-col gap-1.5">
-          {tasks.map((task) => {
-            const taskStatusBadge = TASK_STATUS_BADGE[task.status];
-            const hasRun = task.agentRunId !== null && task.status !== "backlog" && task.status !== "todo";
-            const reason = blockedReasons[task.id];
+        <div className="flex gap-3 overflow-x-auto pb-1">
+          {BOARD_COLUMNS.map((column) => {
+            const items = tasks.filter((t) => t.column === column.key);
             return (
-              <div key={task.id} className="rounded border border-border/60 bg-surface px-2 py-1.5 text-xs">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="font-medium text-foreground">{task.title}</span>
-                  <div className="flex shrink-0 items-center gap-1.5">
-                    {task.agentType && <Badge variant="outline">{task.agentType}</Badge>}
-                    <Badge variant={TASK_PRIORITY_BADGE[task.priority].variant}>
-                      {TASK_PRIORITY_BADGE[task.priority].label}
-                    </Badge>
-                    <Badge variant={taskStatusBadge.variant}>{taskStatusBadge.label}</Badge>
-                  </div>
+              <div
+                key={column.key}
+                className="flex w-56 shrink-0 flex-col gap-1.5 rounded-md border border-border/60 bg-surface/40 p-1.5"
+              >
+                <div className="flex items-center justify-between px-0.5">
+                  <h3 className="text-[11px] font-semibold uppercase tracking-wide text-subtle-foreground">
+                    {column.label}
+                  </h3>
+                  <span className="text-[10px] text-subtle-foreground">{items.length}</span>
                 </div>
-                {task.description && <p className="mt-1 text-muted-foreground">{task.description}</p>}
-                {task.dependsOnTaskId && (
-                  <p className="mt-1 text-[11px] text-subtle-foreground">
-                    Depends on: {titleById.get(task.dependsOnTaskId) ?? task.dependsOnTaskId}
-                  </p>
-                )}
-                {task.status === "blocked" && reason && (
-                  <p className="mt-1 text-[11px] text-warning">Blocked: {reason}</p>
-                )}
-                {hasRun && task.agentRunId && (
-                  <div className="mt-1.5">
-                    <TaskRunLink agentRunId={task.agentRunId} projectId={projectId} />
-                  </div>
-                )}
+                <div className="flex flex-1 flex-col gap-1.5 overflow-y-auto">
+                  {items.length === 0 && column.key === "review" && (
+                    <p className="px-0.5 text-[10px] text-subtle-foreground">No reviewer yet (Phase 4).</p>
+                  )}
+                  {items.map((task) => {
+                    const taskStatusBadge = TASK_STATUS_BADGE[task.status];
+                    const hasRun = task.agentRunId !== null && task.status !== "backlog" && task.status !== "todo";
+                    const reason = blockedReasons[task.id];
+                    return (
+                      <div key={task.id} className="rounded border border-border/60 bg-surface px-2 py-1.5 text-xs">
+                        <span className="font-medium text-foreground">{task.title}</span>
+                        <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                          {task.agentType && <Badge variant="outline">{task.agentType}</Badge>}
+                          <Badge variant={TASK_PRIORITY_BADGE[task.priority].variant}>
+                            {TASK_PRIORITY_BADGE[task.priority].label}
+                          </Badge>
+                          <Badge variant={taskStatusBadge.variant}>{taskStatusBadge.label}</Badge>
+                        </div>
+                        {task.description && <p className="mt-1 text-muted-foreground">{task.description}</p>}
+                        {task.dependsOnTaskId && (
+                          <p className="mt-1 text-[11px] text-subtle-foreground">
+                            Depends on: {titleById.get(task.dependsOnTaskId) ?? task.dependsOnTaskId}
+                          </p>
+                        )}
+                        {task.status === "blocked" && reason && (
+                          <p className="mt-1 text-[11px] text-warning">Blocked: {reason}</p>
+                        )}
+                        {hasRun && task.agentRunId && (
+                          <div className="mt-1.5">
+                            <TaskRunLink agentRunId={task.agentRunId} projectId={projectId} />
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
               </div>
             );
           })}
+        </div>
+      )}
+
+      {tasks && tasks.length > 0 && (
+        <div className="flex flex-col gap-1.5">
+          <h3 className="text-xs font-medium text-foreground">Agent messages</h3>
+          <MissionMessagesPanel mission={mission} entries={tasks} />
         </div>
       )}
 

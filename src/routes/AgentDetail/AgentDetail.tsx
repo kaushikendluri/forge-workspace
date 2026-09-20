@@ -45,6 +45,12 @@ const TOOL_CALL_BADGE: Record<ToolCallStatus, { label: string; variant: "default
 function formatActivitySummary(payloadJson: string): string {
   try {
     const parsed = JSON.parse(payloadJson) as Record<string, unknown>;
+    // M11: a `send_message` tool call's own activity entry — surface it as a
+    // message rather than raw tool-call JSON, reusing this same real
+    // activity-stream entry rather than a separate UI.
+    if (parsed.toolName === "send_message" && typeof parsed.output === "string") {
+      return `Message: ${parsed.output}`;
+    }
     if (typeof parsed.text === "string" && parsed.text.trim().length > 0) return parsed.text;
     if (typeof parsed.summary === "string") return parsed.summary;
     if (typeof parsed.errorMessage === "string" && parsed.errorMessage) return parsed.errorMessage;

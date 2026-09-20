@@ -248,6 +248,26 @@ export interface Task {
   updatedAt: IsoDateTime;
 }
 
+/**
+ * M11: one column of `Tasks.tsx`'s Kanban board. Mirrors
+ * `src-tauri/src/orchestrator/scheduler.rs`'s `BoardColumn` exactly —
+ * `column` on `TaskBoardEntryDto` is computed backend-side (from the same
+ * dependency-graph logic the scheduler itself uses to decide what to run
+ * next), never re-derived in the frontend. `"review"` is never actually
+ * produced by the backend today (no reviewer agent exists before Phase 4) —
+ * it's an honest, always-empty placeholder column, not a fabricated one.
+ */
+export type BoardColumn = "backlog" | "ready" | "running" | "blocked" | "review" | "complete" | "failed" | "cancelled";
+
+/**
+ * One row of the Kanban board: every `Task` field (flattened) plus its
+ * derived `column`. Mirrors `src-tauri/src/commands/mission_commands.rs`'s
+ * `TaskBoardEntryDto`, returned by `list_mission_board`.
+ */
+export interface TaskBoardEntryDto extends Task {
+  column: BoardColumn;
+}
+
 export type MissionStatus = "planning" | "plan_ready" | "approved" | "running" | "completed" | "failed" | "stopped";
 
 /**
@@ -299,5 +319,26 @@ export interface Notification {
   title: string;
   body: string | null;
   isRead: boolean;
+  createdAt: IsoDateTime;
+}
+
+/**
+ * M11: one agent-to-agent structured message within a mission, written by
+ * the `send_message` tool available to a mission-context agent run (see
+ * `src-tauri/src/agent/tools.rs`) and read back by `list_agent_messages` for
+ * Mission Control's messages panel. Mirrors
+ * `src-tauri/src/db/models.rs`'s `AgentMessage`. `toAgentRunId` is `null`
+ * for a mission-wide broadcast (no specific recipient task was named, or
+ * that task hadn't run yet when the message was sent) — this is a
+ * persisted log, not a live chat, so it may also point at a run that has
+ * since finished.
+ */
+export interface AgentMessage {
+  id: string;
+  fromAgentRunId: string;
+  toAgentRunId: string | null;
+  missionId: string;
+  subject: string;
+  body: string;
   createdAt: IsoDateTime;
 }

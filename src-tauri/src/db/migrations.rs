@@ -17,6 +17,7 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("../../migrations/0002_missions.sql")),
         M::up(include_str!("../../migrations/0003_scheduler.sql")),
         M::up(include_str!("../../migrations/0004_max_parallel_agents.sql")),
+        M::up(include_str!("../../migrations/0005_agent_messages.sql")),
     ])
 }
 

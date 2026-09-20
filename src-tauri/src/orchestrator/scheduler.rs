@@ -104,6 +104,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use rusqlite::Connection;
+use serde::Serialize;
 use tauri::{AppHandle, Manager};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -293,6 +294,66 @@ pub fn task_outcome_for_run(status: AgentRunStatus, mission_stop_requested: bool
 
 fn is_terminal_run_status(status: AgentRunStatus) -> bool {
     matches!(status, AgentRunStatus::Completed | AgentRunStatus::Failed | AgentRunStatus::Stopped)
+}
+
+// ---------------------------------------------------------------------
+// M11: Kanban board column derivation. Purely a *read-side label* for
+// `Tasks.tsx`'s board (`commands::mission_commands::list_mission_board`) —
+// never written back to the `tasks` row, and never consulted by
+// `run_mission_inner`'s own scheduling decisions. Reuses `classify_task`
+// (unchanged) rather than re-deriving readiness, so the board can never
+// disagree with what the driver itself would actually do next.
+// ---------------------------------------------------------------------
+
+/// One column of `Tasks.tsx`'s Kanban board. Mirrors `src/types/db.ts`'s
+/// `BoardColumn`. `Review` is never produced by this milestone (no reviewer
+/// agent exists until Phase 4) — it's included only so the frontend can
+/// render an honest, always-empty placeholder column rather than fabricating
+/// one client-side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoardColumn {
+    /// `backlog`/`todo`, but `classify_task` says `Waiting` — genuinely not
+    /// ready yet (its dependency hasn't finished).
+    Backlog,
+    /// `backlog`/`todo`, and `classify_task` says `Ready` — dependencies
+    /// satisfied, just waiting for a free concurrency slot or the
+    /// scheduler's next pass to pick it up.
+    Ready,
+    Running,
+    Blocked,
+    /// Never produced today — see the enum's own docs.
+    Review,
+    Complete,
+    Failed,
+    Cancelled,
+}
+
+/// Derives one task's board column. Terminal/running statuses map directly;
+/// only `backlog`/`todo` need the graph check (`classify_task`, unchanged
+/// from M9/M10) to distinguish "genuinely not ready yet" from "ready".
+pub fn board_column_for_task(task: &Task, by_id: &HashMap<&str, &Task>) -> BoardColumn {
+    match task.status {
+        TaskStatus::InProgress => BoardColumn::Running,
+        TaskStatus::Done => BoardColumn::Complete,
+        TaskStatus::Failed => BoardColumn::Failed,
+        TaskStatus::Blocked => BoardColumn::Blocked,
+        TaskStatus::Cancelled => BoardColumn::Cancelled,
+        TaskStatus::Backlog | TaskStatus::Todo => match classify_task(task, by_id) {
+            TaskReadiness::Ready => BoardColumn::Ready,
+            TaskReadiness::Waiting => BoardColumn::Backlog,
+            TaskReadiness::Blocked { .. } => BoardColumn::Blocked,
+        },
+    }
+}
+
+/// Computes every task's board column from one snapshot (`by_id` built once
+/// and reused across every task, the same way `evaluate` builds it once for
+/// its own pass). Pure, no I/O — see `commands::mission_commands::
+/// list_mission_board`, the only real caller.
+pub fn compute_board_columns(tasks: &[Task]) -> HashMap<String, BoardColumn> {
+    let by_id: HashMap<&str, &Task> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+    tasks.iter().map(|t| (t.id.clone(), board_column_for_task(t, &by_id))).collect()
 }
 
 // ---------------------------------------------------------------------
@@ -1064,5 +1125,66 @@ mod tests {
 
         settings_repo::set(&conn, MAX_PARALLEL_AGENTS_SETTING_KEY, "not-a-number").expect("set");
         assert_eq!(load_max_parallel_agents(&conn).expect("load"), DEFAULT_MAX_PARALLEL_AGENTS as usize);
+    }
+
+    // -- M11: board_column_for_task / compute_board_columns ----------------
+
+    #[test]
+    fn board_column_maps_terminal_and_running_statuses_directly() {
+        let tasks = vec![
+            task("running", TaskStatus::InProgress, 0, None),
+            task("done", TaskStatus::Done, 1, None),
+            task("failed", TaskStatus::Failed, 2, None),
+            task("blocked", TaskStatus::Blocked, 3, None),
+            task("cancelled", TaskStatus::Cancelled, 4, None),
+        ];
+        let columns = compute_board_columns(&tasks);
+        assert_eq!(columns["running"], BoardColumn::Running);
+        assert_eq!(columns["done"], BoardColumn::Complete);
+        assert_eq!(columns["failed"], BoardColumn::Failed);
+        assert_eq!(columns["blocked"], BoardColumn::Blocked);
+        assert_eq!(columns["cancelled"], BoardColumn::Cancelled);
+    }
+
+    #[test]
+    fn board_column_splits_backlog_into_ready_vs_backlog_by_dependency_state() {
+        // No dependency at all -> Ready.
+        let no_dep = vec![task("a", TaskStatus::Backlog, 0, None)];
+        assert_eq!(compute_board_columns(&no_dep)["a"], BoardColumn::Ready);
+
+        // Dependency done -> Ready.
+        let dep_done = vec![task("a", TaskStatus::Done, 0, None), task("b", TaskStatus::Backlog, 1, Some("a"))];
+        assert_eq!(compute_board_columns(&dep_done)["b"], BoardColumn::Ready);
+
+        // Dependency still in flight -> genuinely not ready -> Backlog.
+        let dep_waiting = vec![task("a", TaskStatus::Backlog, 0, None), task("b", TaskStatus::Backlog, 1, Some("a"))];
+        assert_eq!(compute_board_columns(&dep_waiting)["b"], BoardColumn::Backlog);
+    }
+
+    #[test]
+    fn board_column_maps_a_backlog_task_with_a_failed_dependency_to_blocked() {
+        // Mirrors `classify_task`'s own Blocked case — the board must never
+        // show this as Ready or plain Backlog once its dependency has
+        // already failed, even before the scheduler's own next pass has
+        // written `blocked` to the row.
+        let tasks = vec![task("a", TaskStatus::Failed, 0, None), task("b", TaskStatus::Backlog, 1, Some("a"))];
+        assert_eq!(compute_board_columns(&tasks)["b"], BoardColumn::Blocked);
+    }
+
+    #[test]
+    fn board_column_never_produces_review_for_any_real_status() {
+        // Phase 4 scope only — this milestone's board must never fabricate
+        // a task landing in Review.
+        let tasks = vec![
+            task("a", TaskStatus::Backlog, 0, None),
+            task("b", TaskStatus::InProgress, 1, None),
+            task("c", TaskStatus::Done, 2, None),
+            task("d", TaskStatus::Failed, 3, None),
+            task("e", TaskStatus::Blocked, 4, None),
+            task("f", TaskStatus::Cancelled, 5, None),
+        ];
+        for column in compute_board_columns(&tasks).values() {
+            assert_ne!(*column, BoardColumn::Review);
+        }
     }
 }

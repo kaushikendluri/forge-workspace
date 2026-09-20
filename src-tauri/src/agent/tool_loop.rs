@@ -19,12 +19,12 @@ use tauri::{AppHandle, Manager};
 use tokio_util::sync::CancellationToken;
 
 use crate::db::models::{
-    Agent, ActivityEventType, AgentRun, AgentRunStatus, AgentRunStopReason, AgentStatus, NotificationType, Workspace,
+    Agent, ActivityEventType, AgentRun, AgentRunStatus, AgentRunStopReason, AgentStatus, NotificationType, Task, Workspace,
 };
 use crate::db::repository::{
     activity_events as activity_events_repo, agent_runs as agent_runs_repo, agents as agents_repo,
     model_configs as model_configs_repo, notifications as notifications_repo, settings as settings_repo,
-    workspaces as workspaces_repo,
+    tasks as tasks_repo, workspaces as workspaces_repo,
 };
 use crate::db::DbConnection;
 use crate::error::{AppError, AppResult};
@@ -36,8 +36,8 @@ use crate::state::AppState;
 use super::anthropic_client::{AnthropicClient, AssistantContentBlock, ContentBlockParam, MessageParam, StreamOutcome};
 use super::events as agent_events;
 use super::executor::{run_one_tool_call, ExecutedTool};
-use super::schema::all_tool_definitions;
-use super::tools::ToolContext;
+use super::schema::{all_tool_definitions, send_message_tool_definition};
+use super::tools::{MissionContext, ToolContext};
 
 const DEFAULT_MAX_ITERATIONS: i64 = 40;
 const DEFAULT_TOOL_TIMEOUT_MS: u64 = 30_000;
@@ -376,8 +376,26 @@ async fn run_agent_loop_inner(app: &AppHandle, agent_run_id: &str, cancel: &Canc
     agent_events::run_status_changed(app, agent_run_id, &setup.agent.id, AgentRunStatus::Running)?;
     agent_events::agent_status_changed(app, &setup.agent.id, AgentStatus::Running)?;
 
+    // M11: resolve, once, whether this run is executing as part of a mission
+    // (the scheduler linked a task to it via `tasks_repo::set_agent_run_id`
+    // before starting it) — `None` for a solo run started directly from the
+    // Agents page. Drives both which tools the model is offered
+    // (`send_message` only for a mission-context run) and what
+    // `ToolContext::mission_context` carries for the tool's own dispatch.
+    let mission_context: Option<MissionContext> = {
+        let conn = get_conn(app)?;
+        tasks_repo::get_by_agent_run_id(&conn, agent_run_id)?.and_then(|t| {
+            let Task { id: task_id, mission_id, .. } = t;
+            mission_id.map(|mission_id| MissionContext { mission_id, task_id })
+        })
+    };
+    let db_pool = app.state::<AppState>().db.clone();
+
     let client = AnthropicClient::new(api_key)?;
-    let tool_defs = all_tool_definitions();
+    let mut tool_defs = all_tool_definitions();
+    if mission_context.is_some() {
+        tool_defs.push(send_message_tool_definition());
+    }
     let workspace_root = PathBuf::from(&setup.workspace.path);
     let system_prompt = build_system_prompt(&setup);
     let model_id = setup.agent_run.model_id.clone();
@@ -478,6 +496,9 @@ async fn run_agent_loop_inner(app: &AppHandle, agent_run_id: &str, cancel: &Canc
             build_command: setup.build_command.clone(),
             tool_timeout: setup.tool_timeout,
             cancel: cancel.clone(),
+            agent_run_id: agent_run_id.to_string(),
+            mission_context: mission_context.clone(),
+            db_pool: db_pool.clone(),
         };
 
         let mut tool_results: Vec<ContentBlockParam> = Vec::with_capacity(tool_uses.len());

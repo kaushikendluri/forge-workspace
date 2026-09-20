@@ -16,10 +16,25 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use crate::db::models::Task;
+use crate::db::repository::{agent_messages as agent_messages_repo, tasks as tasks_repo};
+use crate::db::DbPool;
 use crate::git::GitService;
 use crate::os_adapter::OperatingSystemAdapter;
 
 use super::path_guard::resolve_in_workspace;
+
+/// M11: set on `ToolContext` only when this run is executing as part of a
+/// mission (the scheduler started it for a specific mission task, via
+/// `orchestrator::scheduler::start_task_execution`) — see
+/// `agent::tool_loop::run_agent_loop_inner`, which resolves this once via
+/// `tasks_repo::get_by_agent_run_id`. `None` for a solo run started directly
+/// from the Agents page. `send_message` is the only tool that reads this.
+#[derive(Debug, Clone)]
+pub struct MissionContext {
+    pub mission_id: String,
+    pub task_id: String,
+}
 
 /// Everything a tool call needs that isn't in its own JSON `input` — the
 /// run's workspace root plus the services/config it's allowed to touch.
@@ -35,6 +50,17 @@ pub struct ToolContext<'a> {
     pub build_command: Option<String>,
     pub tool_timeout: Duration,
     pub cancel: CancellationToken,
+    /// M11: this run's own id (`agent_runs.id`) — none of the tools before
+    /// M11 needed to know their own run's id (they only ever touch the
+    /// workspace filesystem/git/shell); `send_message` needs it as the new
+    /// message's `from_agent_run_id`.
+    pub agent_run_id: String,
+    /// M11: `Some` only for a mission-context run — see [`MissionContext`].
+    pub mission_context: Option<MissionContext>,
+    /// M11: pooled DB access for `send_message` to look up the mission's
+    /// other tasks (to resolve `to_task_title`) and persist the
+    /// `agent_messages` row. Every other tool here is DB-free.
+    pub db_pool: DbPool,
 }
 
 /// What running one tool call produced.
@@ -80,6 +106,7 @@ pub async fn dispatch_tool(ctx: &ToolContext<'_>, name: &str, input: &Value) -> 
         "git_status" => git_status(ctx),
         "git_diff" => git_diff(ctx, input),
         "git_log" => git_log(ctx, input),
+        "send_message" => send_message(ctx, input),
         "report_completion" => report_completion(input),
         other => err(format!("unknown tool '{other}'")),
     }
@@ -524,6 +551,73 @@ fn git_log(ctx: &ToolContext<'_>, input: &Value) -> ToolRunOutcome {
 }
 
 // ---------------------------------------------------------------------
+// send_message (M11) — agent-to-agent structured messages within a mission.
+// Only reachable at all when `ctx.mission_context` is `Some` (see
+// `agent::schema::send_message_tool_definition`'s own docs for why the model
+// never even sees this tool otherwise); dispatch still handles the `None`
+// case defensively rather than assuming that invariant always holds.
+// ---------------------------------------------------------------------
+
+/// Resolves `to_task_title` (if given) to the most recent `agent_run_id` of
+/// the matching task in `mission_tasks` — best-effort, exactly as the M11
+/// spec describes: `None` if no title was given, or if a matching task
+/// exists but hasn't been started yet (its `agent_run_id` is still unset).
+/// Pure — no I/O — so this is unit-tested directly, independent of
+/// `send_message`'s own DB wiring. Returns `Err` only when a title was given
+/// but no task in the mission has that exact title (a likely typo the model
+/// can react to), distinct from "found the task, it just hasn't run yet"
+/// (`Ok(None)`, not an error — the message is still recorded).
+fn resolve_recipient_agent_run_id(mission_tasks: &[Task], to_task_title: Option<&str>) -> Result<Option<String>, String> {
+    let Some(title) = to_task_title else { return Ok(None) };
+    match mission_tasks.iter().find(|t| t.title == title) {
+        Some(task) => Ok(task.agent_run_id.clone()),
+        None => Err(format!(
+            "no task titled '{title}' was found in this mission — check the exact task title (case-sensitive) and try again, or omit to_task_title to broadcast"
+        )),
+    }
+}
+
+fn send_message(ctx: &ToolContext<'_>, input: &Value) -> ToolRunOutcome {
+    let Some(mission) = &ctx.mission_context else {
+        return err(
+            "send_message is only available when this run is executing as part of a mission — this run is a \
+             standalone agent run with no mission context."
+                .to_string(),
+        );
+    };
+    let subject = match require_str(input, "subject") {
+        Ok(s) => s,
+        Err(e) => return err(e),
+    };
+    let body = match require_str(input, "body") {
+        Ok(s) => s,
+        Err(e) => return err(e),
+    };
+    let to_task_title = input.get("to_task_title").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+
+    let conn = match ctx.db_pool.get() {
+        Ok(c) => c,
+        Err(e) => return err(format!("failed to open a database connection: {e}")),
+    };
+    let mission_tasks = match tasks_repo::list_for_mission(&conn, &mission.mission_id) {
+        Ok(tasks) => tasks,
+        Err(e) => return err(format!("failed to look up this mission's tasks: {e}")),
+    };
+    let to_agent_run_id = match resolve_recipient_agent_run_id(&mission_tasks, to_task_title) {
+        Ok(id) => id,
+        Err(e) => return err(e),
+    };
+
+    match agent_messages_repo::insert(&conn, &ctx.agent_run_id, to_agent_run_id.as_deref(), &mission.mission_id, subject, body) {
+        Ok(_message) => ok(match to_task_title {
+            Some(title) => format!("message sent to task \"{title}\""),
+            None => "message broadcast to the whole mission".to_string(),
+        }),
+        Err(e) => err(format!("failed to record message: {e}")),
+    }
+}
+
+// ---------------------------------------------------------------------
 // report_completion — ends the run rather than producing a tool_result.
 // ---------------------------------------------------------------------
 
@@ -606,6 +700,25 @@ mod tests {
         }
     }
 
+    /// A fresh, migrated in-memory DB pool for `send_message` tests.
+    /// `max_size(1)` (rather than `r2d2`'s default of several) is what makes
+    /// this work at all: `SqliteConnectionManager::memory()` gives each new
+    /// physical connection its own separate, empty in-memory database, so a
+    /// pool that could hand out more than one distinct connection would look
+    /// like data vanishing between calls. Capped at one, `.get()` always
+    /// hands back the same single connection (returned to the pool when its
+    /// guard drops), so state written through one `.get()` call is still
+    /// there on the next.
+    fn test_db_pool() -> DbPool {
+        let manager = r2d2_sqlite::SqliteConnectionManager::memory();
+        let pool = r2d2::Pool::builder().max_size(1).build(manager).expect("build in-memory pool");
+        {
+            let mut conn = pool.get().expect("get conn");
+            crate::db::migrations::run_migrations(&mut conn).expect("run migrations");
+        }
+        pool
+    }
+
     fn test_ctx<'a>(workspace_root: PathBuf, git: &'a FakeGitService, os: &'a FakeOsAdapter) -> ToolContext<'a> {
         ToolContext {
             workspace_root,
@@ -616,6 +729,9 @@ mod tests {
             build_command: None,
             tool_timeout: Duration::from_secs(5),
             cancel: CancellationToken::new(),
+            agent_run_id: "test-run".to_string(),
+            mission_context: None,
+            db_pool: test_db_pool(),
         }
     }
 
@@ -815,5 +931,231 @@ mod tests {
             }
             ToolRunOutcome::Completion { .. } => panic!("unexpected completion"),
         }
+    }
+
+    // -- send_message (M11) -------------------------------------------------
+
+    /// Seeds the rows `send_message` needs: a project/repo/agent, a mission
+    /// with two tasks ("Sender" already linked to `run1`, "Recipient" not
+    /// yet started — `agent_run_id` still `NULL`), and the two `agent_runs`
+    /// rows themselves.
+    fn seed_mission_with_two_tasks(pool: &DbPool) {
+        let conn = pool.get().expect("get conn");
+        conn.execute("INSERT INTO projects (id, name) VALUES ('p1', 'Test')", []).unwrap();
+        conn.execute("INSERT INTO repositories (id, project_id, root_path) VALUES ('r1', 'p1', '/tmp/r1')", []).unwrap();
+        conn.execute("INSERT INTO agents (id, project_id, repository_id, name) VALUES ('a1', 'p1', 'r1', 'Bot')", []).unwrap();
+        conn.execute("INSERT INTO missions (id, project_id, objective) VALUES ('m1', 'p1', 'Ship it')", []).unwrap();
+        conn.execute(
+            "INSERT INTO agent_runs (id, agent_id, task_prompt, model_id) VALUES ('run1', 'a1', 'sender task', 'claude-sonnet-5')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, project_id, mission_id, title, status, priority, position, agent_run_id) \
+             VALUES ('t-sender', 'p1', 'm1', 'Sender', 'in_progress', 'medium', 0, 'run1')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, project_id, mission_id, title, status, priority, position, agent_run_id) \
+             VALUES ('t-recipient', 'p1', 'm1', 'Recipient', 'backlog', 'medium', 1, NULL)",
+            [],
+        )
+        .unwrap();
+    }
+
+    fn mission_ctx<'a>(pool: DbPool, ws: PathBuf, git: &'a FakeGitService, os: &'a FakeOsAdapter) -> ToolContext<'a> {
+        ToolContext {
+            workspace_root: ws,
+            git_service: git,
+            os_adapter: os,
+            test_command: None,
+            lint_command: None,
+            build_command: None,
+            tool_timeout: Duration::from_secs(5),
+            cancel: CancellationToken::new(),
+            agent_run_id: "run1".to_string(),
+            mission_context: Some(MissionContext { mission_id: "m1".to_string(), task_id: "t-sender".to_string() }),
+            db_pool: pool,
+        }
+    }
+
+    #[tokio::test]
+    async fn send_message_without_mission_context_is_a_clear_tool_error() {
+        let ws = tempfile::tempdir().unwrap();
+        let git = FakeGitService;
+        let os = FakeOsAdapter;
+        // Reuses the ordinary (non-mission) test_ctx — mission_context: None.
+        let ctx = test_ctx(ws.path().to_path_buf(), &git, &os);
+
+        let outcome = dispatch_tool(&ctx, "send_message", &serde_json::json!({"subject": "hi", "body": "body"})).await;
+        match outcome {
+            ToolRunOutcome::Result { is_error, output } => {
+                assert!(is_error);
+                assert!(output.contains("mission"), "error should explain why: {output}");
+            }
+            ToolRunOutcome::Completion { .. } => panic!("send_message must never end the run"),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_message_broadcasts_when_to_task_title_is_omitted() {
+        let ws = tempfile::tempdir().unwrap();
+        let git = FakeGitService;
+        let os = FakeOsAdapter;
+        let pool = test_db_pool();
+        seed_mission_with_two_tasks(&pool);
+        let ctx = mission_ctx(pool.clone(), ws.path().to_path_buf(), &git, &os);
+
+        let outcome = dispatch_tool(&ctx, "send_message", &serde_json::json!({"subject": "Status", "body": "On track"})).await;
+        match outcome {
+            ToolRunOutcome::Result { is_error, output } => {
+                assert!(!is_error, "{output}");
+                assert!(output.contains("broadcast"));
+            }
+            ToolRunOutcome::Completion { .. } => panic!("unexpected completion"),
+        }
+
+        let conn = pool.get().unwrap();
+        let messages = crate::db::repository::agent_messages::list_for_mission(&conn, "m1").unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].from_agent_run_id, "run1");
+        assert!(messages[0].to_agent_run_id.is_none());
+        assert_eq!(messages[0].subject, "Status");
+    }
+
+    #[tokio::test]
+    async fn send_message_resolves_to_task_title_to_that_tasks_agent_run_id() {
+        let ws = tempfile::tempdir().unwrap();
+        let git = FakeGitService;
+        let os = FakeOsAdapter;
+        let pool = test_db_pool();
+        seed_mission_with_two_tasks(&pool);
+        // Link the recipient task to a real run so resolution has something
+        // to find.
+        {
+            let conn = pool.get().unwrap();
+            conn.execute(
+                "INSERT INTO agent_runs (id, agent_id, task_prompt, model_id) VALUES ('run2', 'a1', 'recipient task', 'claude-sonnet-5')",
+                [],
+            )
+            .unwrap();
+            conn.execute("UPDATE tasks SET agent_run_id = 'run2' WHERE id = 't-recipient'", []).unwrap();
+        }
+        let ctx = mission_ctx(pool.clone(), ws.path().to_path_buf(), &git, &os);
+
+        let outcome = dispatch_tool(
+            &ctx,
+            "send_message",
+            &serde_json::json!({"subject": "Handoff", "body": "Schema is ready", "to_task_title": "Recipient"}),
+        )
+        .await;
+        assert!(matches!(outcome, ToolRunOutcome::Result { is_error: false, .. }));
+
+        let conn = pool.get().unwrap();
+        let messages = crate::db::repository::agent_messages::list_for_mission(&conn, "m1").unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].to_agent_run_id.as_deref(), Some("run2"));
+    }
+
+    #[tokio::test]
+    async fn send_message_to_a_task_that_has_not_run_yet_still_records_the_message() {
+        // Spec: "if that task hasn't run yet or already finished, still
+        // record the message" — best-effort, not a live-chat requirement.
+        let ws = tempfile::tempdir().unwrap();
+        let git = FakeGitService;
+        let os = FakeOsAdapter;
+        let pool = test_db_pool();
+        seed_mission_with_two_tasks(&pool); // "Recipient" has no agent_run_id yet.
+        let ctx = mission_ctx(pool.clone(), ws.path().to_path_buf(), &git, &os);
+
+        let outcome = dispatch_tool(
+            &ctx,
+            "send_message",
+            &serde_json::json!({"subject": "Heads up", "body": "starting soon", "to_task_title": "Recipient"}),
+        )
+        .await;
+        match outcome {
+            ToolRunOutcome::Result { is_error, .. } => assert!(!is_error, "recording against a not-yet-started task must still succeed"),
+            ToolRunOutcome::Completion { .. } => panic!("unexpected completion"),
+        }
+
+        let conn = pool.get().unwrap();
+        let messages = crate::db::repository::agent_messages::list_for_mission(&conn, "m1").unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].to_agent_run_id.is_none(), "the task exists but has no run yet, so there's nothing to link to");
+    }
+
+    #[tokio::test]
+    async fn send_message_with_an_unknown_task_title_is_a_clear_tool_error() {
+        let ws = tempfile::tempdir().unwrap();
+        let git = FakeGitService;
+        let os = FakeOsAdapter;
+        let pool = test_db_pool();
+        seed_mission_with_two_tasks(&pool);
+        let ctx = mission_ctx(pool.clone(), ws.path().to_path_buf(), &git, &os);
+
+        let outcome = dispatch_tool(
+            &ctx,
+            "send_message",
+            &serde_json::json!({"subject": "hi", "body": "body", "to_task_title": "Nonexistent Task"}),
+        )
+        .await;
+        match outcome {
+            ToolRunOutcome::Result { is_error, output } => {
+                assert!(is_error);
+                assert!(output.contains("Nonexistent Task"));
+            }
+            ToolRunOutcome::Completion { .. } => panic!("unexpected completion"),
+        }
+
+        let conn = pool.get().unwrap();
+        let messages = crate::db::repository::agent_messages::list_for_mission(&conn, "m1").unwrap();
+        assert!(messages.is_empty(), "a bad title should not record a phantom message");
+    }
+
+    // -- resolve_recipient_agent_run_id (pure) -------------------------------
+
+    fn task_with_run(id: &str, title: &str, agent_run_id: Option<&str>) -> Task {
+        use crate::db::models::{TaskPriority, TaskStatus};
+        Task {
+            id: id.to_string(),
+            project_id: "p1".to_string(),
+            mission_id: Some("m1".to_string()),
+            title: title.to_string(),
+            description: None,
+            status: TaskStatus::Backlog,
+            priority: TaskPriority::Medium,
+            position: 0,
+            depends_on_task_id: None,
+            agent_type: None,
+            agent_run_id: agent_run_id.map(str::to_string),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn resolve_recipient_returns_none_without_a_title() {
+        let tasks = vec![task_with_run("t1", "A", Some("run1"))];
+        assert_eq!(resolve_recipient_agent_run_id(&tasks, None), Ok(None));
+    }
+
+    #[test]
+    fn resolve_recipient_finds_the_matching_tasks_agent_run_id() {
+        let tasks = vec![task_with_run("t1", "A", Some("run1")), task_with_run("t2", "B", Some("run2"))];
+        assert_eq!(resolve_recipient_agent_run_id(&tasks, Some("B")), Ok(Some("run2".to_string())));
+    }
+
+    #[test]
+    fn resolve_recipient_is_ok_none_for_a_task_that_has_not_run_yet() {
+        let tasks = vec![task_with_run("t1", "A", None)];
+        assert_eq!(resolve_recipient_agent_run_id(&tasks, Some("A")), Ok(None));
+    }
+
+    #[test]
+    fn resolve_recipient_errors_for_an_unknown_title() {
+        let tasks = vec![task_with_run("t1", "A", Some("run1"))];
+        assert!(resolve_recipient_agent_run_id(&tasks, Some("does not exist")).is_err());
     }
 }

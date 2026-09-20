@@ -183,6 +183,18 @@ pub fn update_status(conn: &Connection, id: &str, status: TaskStatus) -> AppResu
     Ok(())
 }
 
+/// The task (if any) that `agent_run_id` belongs to — the reverse lookup of
+/// `set_agent_run_id`. M11 uses this to determine, once a run's loop starts,
+/// whether it's executing as part of a mission (and if so, which task) so
+/// `agent::tools::send_message` can be offered/scoped correctly. A run
+/// started directly from the Agents page (never linked to a task) returns
+/// `None`.
+pub fn get_by_agent_run_id(conn: &Connection, agent_run_id: &str) -> AppResult<Option<Task>> {
+    conn.query_row(&format!("SELECT {SELECT_COLUMNS} FROM tasks WHERE agent_run_id = ?1"), params![agent_run_id], row_to_task)
+        .optional()
+        .map_err(Into::into)
+}
+
 /// Links a task to the agent run the scheduler (M9) started for it — the
 /// other half of `tasks.agent_run_id`, set once `start_worktree_for_agent`
 /// has produced a real run to link (mirrors
@@ -322,5 +334,45 @@ mod tests {
 
         let fetched = get_by_id(&conn, &task.id).expect("get_by_id").expect("exists");
         assert_eq!(fetched.agent_run_id.as_deref(), Some("run1"));
+    }
+
+    #[test]
+    fn get_by_agent_run_id_is_the_reverse_lookup_of_set_agent_run_id() {
+        let conn = setup_conn();
+        conn.execute("INSERT INTO repositories (id, project_id, root_path) VALUES ('r1', 'p1', '/tmp/r1')", [])
+            .expect("insert repository");
+        conn.execute("INSERT INTO agents (id, project_id, repository_id, name) VALUES ('a1', 'p1', 'r1', 'Bot')", [])
+            .expect("insert agent");
+        conn.execute(
+            "INSERT INTO agent_runs (id, agent_id, task_prompt, model_id) VALUES ('run1', 'a1', 'do it', 'claude-sonnet-5')",
+            [],
+        )
+        .expect("insert agent_run");
+
+        let task = insert_for_mission(&conn, "p1", "m1", "Provision the database", None, "database", TaskPriority::High, 0)
+            .expect("insert_for_mission");
+        assert!(get_by_agent_run_id(&conn, "run1").expect("get_by_agent_run_id").is_none());
+
+        set_agent_run_id(&conn, &task.id, "run1").expect("set_agent_run_id");
+
+        let found = get_by_agent_run_id(&conn, "run1").expect("get_by_agent_run_id").expect("exists");
+        assert_eq!(found.id, task.id);
+        assert_eq!(found.mission_id.as_deref(), Some("m1"));
+    }
+
+    #[test]
+    fn get_by_agent_run_id_returns_none_for_a_solo_non_mission_run() {
+        let conn = setup_conn();
+        conn.execute("INSERT INTO repositories (id, project_id, root_path) VALUES ('r1', 'p1', '/tmp/r1')", [])
+            .expect("insert repository");
+        conn.execute("INSERT INTO agents (id, project_id, repository_id, name) VALUES ('a1', 'p1', 'r1', 'Bot')", [])
+            .expect("insert agent");
+        conn.execute(
+            "INSERT INTO agent_runs (id, agent_id, task_prompt, model_id) VALUES ('run1', 'a1', 'do it', 'claude-sonnet-5')",
+            [],
+        )
+        .expect("insert agent_run");
+
+        assert!(get_by_agent_run_id(&conn, "run1").expect("get_by_agent_run_id").is_none());
     }
 }
