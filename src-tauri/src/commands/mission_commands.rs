@@ -6,12 +6,15 @@
 //! persists the result as real `tasks` rows. `approve_mission_plan` is as
 //! far as M8 goes.
 //!
-//! M9 adds `start_mission`/`stop_mission`, which consume `status =
+//! M9 added `start_mission`/`stop_mission`, which consume `status =
 //! 'approved'`: they mirror `commands::agent_run_commands`'s
 //! `start_agent_run`/`stop_agent_run` shape exactly — register/look up a
 //! `CancellationToken` in `AppState.active_missions`, spawn/cancel the real
 //! driver (`orchestrator::scheduler::run_mission`) — with `active_missions`
-//! standing in for `active_runs` one level up.
+//! standing in for `active_runs` one level up. M10 changed nothing about
+//! this pair of commands themselves — `run_mission` now runs multiple ready
+//! tasks concurrently internally, but starting/stopping *the mission* is
+//! still exactly one `CancellationToken` registered/cancelled, same as M9.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -249,10 +252,11 @@ pub async fn list_mission_tasks(app: AppHandle, mission_id: String) -> Result<Ve
     .await
 }
 
-/// M9: starts real execution of an `approved` mission's plan — spawns
+/// Starts real execution of an `approved` mission's plan — spawns
 /// `orchestrator::scheduler::run_mission`, which walks the task dependency
-/// graph and runs each task, sequentially, through the real M5/M6 agent
-/// pipeline. Registers the mission's `CancellationToken` in
+/// graph and runs ready tasks through the real M5/M6 agent pipeline, up to
+/// `agent.max_parallel_agents` of them concurrently (M10; M9 ran one at a
+/// time). Registers the mission's `CancellationToken` in
 /// `AppState.active_missions` *before* spawning the scheduler, mirroring
 /// `agent_run_commands::start_agent_run` exactly, so a `stop_mission` call
 /// made immediately after this returns is guaranteed to find it. The actual
@@ -298,11 +302,13 @@ pub async fn start_mission(app: AppHandle, mission_id: String) -> Result<(), Str
     Ok(())
 }
 
-/// M9: cancels a currently-running mission — fires its `CancellationToken`,
-/// which `run_mission` observes between tasks (and forwards as a real
-/// `stop_agent_run` against whichever task's run is currently active).
-/// Errors if `mission_id` isn't currently active, mirroring
-/// `agent_run_commands::stop_agent_run`.
+/// Cancels a currently-running mission — fires its `CancellationToken`,
+/// which `run_mission` observes and forwards as a real `stop_agent_run`
+/// call against *every* task run currently active for this mission (M10:
+/// there may be several at once, up to `agent.max_parallel_agents` — each
+/// one's own poll loop observes this same token independently, see
+/// `orchestrator::scheduler`'s module docs). Errors if `mission_id` isn't
+/// currently active, mirroring `agent_run_commands::stop_agent_run`.
 #[tauri::command]
 pub async fn stop_mission(app: AppHandle, mission_id: String) -> Result<(), String> {
     run_blocking(move || -> AppResult<()> {
