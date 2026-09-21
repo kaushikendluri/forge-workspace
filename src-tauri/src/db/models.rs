@@ -68,6 +68,13 @@ pub enum AgentRunStopReason {
     MaxIterations,
     UserStopped,
     Error,
+    /// M13: the run's `agent.max_test_fix_attempts` cap for the self-healing
+    /// test-fix cycle was exceeded — see `agent::test_fix::TestFixTracker`.
+    /// Distinct from `Error`: this is not a failure of the run itself (the
+    /// model may have been doing legitimate, unrelated work), just a
+    /// deliberate stop so a human can look rather than letting the
+    /// fail→fix→retest cycle run unbounded.
+    TestFixBudgetExhausted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +91,10 @@ pub struct AgentRun {
     pub iteration_count: i64,
     pub total_input_tokens: i64,
     pub total_output_tokens: i64,
+    /// M13: the self-healing test-fix cycle's bounded retry counter — see
+    /// `agent::test_fix::TestFixTracker`. Mirrored here from the in-memory
+    /// tracker each time it changes, not incremented directly by SQL.
+    pub test_fix_attempts: i64,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
 }
@@ -153,6 +164,15 @@ pub enum ActivityEventType {
     RunCompleted,
     RunStopped,
     Error,
+    /// M13: emitted specifically when a `run_tests` failure is detected
+    /// (the start of a potential fix attempt) and again when a subsequent
+    /// retest of that attempt completes (pass or still failing), plus once
+    /// more if the run's `agent.max_test_fix_attempts` budget is exceeded —
+    /// see `agent::test_fix::TestFixTracker`. Its `payload_json` carries
+    /// `phase` (`"failed"` | `"retested"` | `"budget_exhausted"`), `attempt`,
+    /// and — when it refers to one — the `testRunId` of the real
+    /// `test_runs` row (M12) for that specific test run.
+    TestFixCycle,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

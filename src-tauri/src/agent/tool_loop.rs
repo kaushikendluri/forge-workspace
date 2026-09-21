@@ -37,11 +37,21 @@ use super::anthropic_client::{AnthropicClient, AssistantContentBlock, ContentBlo
 use super::events as agent_events;
 use super::executor::{run_one_tool_call, ExecutedTool};
 use super::schema::{all_tool_definitions, send_message_tool_definition};
+use super::test_fix::{TestFixEvent, TestFixTracker};
 use super::tools::{MissionContext, ToolContext};
 
 const DEFAULT_MAX_ITERATIONS: i64 = 40;
 const DEFAULT_TOOL_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_MAX_TOKENS: u32 = 8192;
+/// M13: default cap for `agent.max_test_fix_attempts` — how many times the
+/// self-healing test-fix cycle (see `agent::test_fix`) may retry
+/// `run_tests` after a failure before the run stops itself rather than
+/// looping. Deliberately its own, much smaller budget than
+/// `DEFAULT_MAX_ITERATIONS`: 3 genuine fix attempts is already a lot for one
+/// failing test suite, and a much larger `max_iterations` value shouldn't
+/// let this specific pathological pattern (fail, "fix", fail, "fix", ...)
+/// run any longer than that.
+const DEFAULT_MAX_TEST_FIX_ATTEMPTS: i64 = 3;
 /// Three tool calls in a row coming back as errors is treated as the agent
 /// being stuck (wrong command, missing dependency, repeatedly malformed
 /// input, ...) rather than something more retries will fix.
@@ -105,6 +115,8 @@ struct RunSetup {
     lint_command: Option<String>,
     build_command: Option<String>,
     model_max_tokens: u32,
+    /// M13: `agent.max_test_fix_attempts` — see [`DEFAULT_MAX_TEST_FIX_ATTEMPTS`].
+    max_test_fix_attempts: i64,
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
@@ -154,6 +166,11 @@ fn load_run_setup(conn: &Connection, agent_run_id: &str) -> AppResult<RunSetup> 
         .map(|m| m.max_output_tokens as u32)
         .unwrap_or(DEFAULT_MAX_TOKENS);
 
+    let max_test_fix_attempts = settings_repo::get(conn, "agent.max_test_fix_attempts")?
+        .and_then(|s| s.value.parse::<i64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_MAX_TEST_FIX_ATTEMPTS);
+
     Ok(RunSetup {
         agent_run,
         agent,
@@ -164,6 +181,7 @@ fn load_run_setup(conn: &Connection, agent_run_id: &str) -> AppResult<RunSetup> 
         lint_command,
         build_command,
         model_max_tokens,
+        max_test_fix_attempts,
     })
 }
 
@@ -188,6 +206,24 @@ fn build_system_prompt(setup: &RunSetup) -> String {
         base = setup.workspace.base_branch.as_deref().unwrap_or("(unknown)"),
         task = setup.agent_run.task_prompt,
     )
+}
+
+/// Builds a `test_fix_cycle` activity event's `payload_json` for one
+/// `TestFixEvent` — `AgentDetail.tsx`'s activity stream renders `phase` (and
+/// `attempt`/`passed`) into "Attempt N: tests failed → investigating" /
+/// "Attempt N: retest passed/still failing" text. `test_run_id`, when
+/// present, is the real `test_runs` row (M12) this specific `run_tests` call
+/// persisted, so the UI can link straight to its full output instead of
+/// this event duplicating it.
+fn test_fix_event_payload(event: &TestFixEvent, test_run_id: Option<&str>) -> String {
+    match event {
+        TestFixEvent::Failed { attempt } => {
+            serde_json::json!({ "phase": "failed", "attempt": attempt, "testRunId": test_run_id }).to_string()
+        }
+        TestFixEvent::Retested { attempt, passed } => {
+            serde_json::json!({ "phase": "retested", "attempt": attempt, "passed": passed, "testRunId": test_run_id }).to_string()
+        }
+    }
 }
 
 fn to_content_block_param(block: &AssistantContentBlock) -> ContentBlockParam {
@@ -271,6 +307,9 @@ fn notification_for_outcome(
                 AgentRunStopReason::MaxIterations => "Reached the maximum number of iterations.".to_string(),
                 AgentRunStopReason::UserStopped => "Stopped by user request.".to_string(),
                 AgentRunStopReason::Error => "The run failed.".to_string(),
+                AgentRunStopReason::TestFixBudgetExhausted => {
+                    "Reached the maximum number of test-fix attempts.".to_string()
+                }
             })
         });
     (notification_type, title, body)
@@ -417,6 +456,9 @@ async fn run_agent_loop_inner(app: &AppHandle, agent_run_id: &str, cancel: &Canc
     let mut messages = vec![MessageParam::user_text(setup.agent_run.task_prompt.clone())];
     let mut consecutive_tool_errors: u32 = 0;
     let mut sequence_number: i64 = 0;
+    // M13: the self-healing test-fix cycle's own, bounded tracking — see
+    // `agent::test_fix` for the heuristic and the cap's exact semantics.
+    let mut test_fix_tracker = TestFixTracker::new();
 
     for iteration in 1..=setup.max_iterations {
         if cancel.is_cancelled() {
@@ -507,6 +549,7 @@ async fn run_agent_loop_inner(app: &AppHandle, agent_run_id: &str, cancel: &Canc
             agent_run_id: agent_run_id.to_string(),
             mission_context: mission_context.clone(),
             db_pool: db_pool.clone(),
+            project_id: setup.agent.project_id.clone(),
         };
 
         let mut tool_results: Vec<ContentBlockParam> = Vec::with_capacity(tool_uses.len());
@@ -530,9 +573,72 @@ async fn run_agent_loop_inner(app: &AppHandle, agent_run_id: &str, cancel: &Canc
                 run_one_tool_call(app, &ctx, agent_run_id, sequence_number, &tool_use_id, &tool_name, &input).await?;
 
             match executed {
-                ExecutedTool::ToolResult { block, is_error } => {
+                ExecutedTool::ToolResult { block, is_error, test_run_id } => {
                     consecutive_tool_errors = if is_error { consecutive_tool_errors + 1 } else { 0 };
                     tool_results.push(block);
+
+                    // M13: only `run_tests` calls feed the self-healing
+                    // test-fix tracker — everything else about "what
+                    // happened in between" (write_file/edit_file/other
+                    // tool calls) is irrelevant to the heuristic by
+                    // construction (see `agent::test_fix` module docs).
+                    if tool_name == "run_tests" {
+                        let fix_events = test_fix_tracker.observe(is_error);
+                        if !fix_events.is_empty() {
+                            let conn = get_conn(app)?;
+                            for fix_event in &fix_events {
+                                let payload = test_fix_event_payload(fix_event, test_run_id.as_deref());
+                                let event = activity_events_repo::insert(
+                                    &conn,
+                                    agent_run_id,
+                                    None,
+                                    ActivityEventType::TestFixCycle,
+                                    &payload,
+                                )?;
+                                agent_events::activity(app, agent_run_id, event)?;
+                            }
+                            agent_runs_repo::set_test_fix_attempts(&conn, agent_run_id, test_fix_tracker.attempts())?;
+                        }
+
+                        if let Some(attempts) = test_fix_tracker.check_budget(setup.max_test_fix_attempts) {
+                            // Flag it clearly in the activity stream, then
+                            // stop the run — deliberately `Stopped`, not
+                            // `Failed`: the model may well have been doing
+                            // legitimate work, this is just a deliberate
+                            // "a human should look at this" halt rather than
+                            // letting fail→fix→retest run unbounded. This is
+                            // also what actually *terminates* the run here —
+                            // not `max_iterations`, which could be set far
+                            // higher than this budget.
+                            let conn = get_conn(app)?;
+                            let payload = serde_json::json!({
+                                "phase": "budget_exhausted",
+                                "attempts": attempts,
+                                "cap": setup.max_test_fix_attempts,
+                            })
+                            .to_string();
+                            let event =
+                                activity_events_repo::insert(&conn, agent_run_id, None, ActivityEventType::TestFixCycle, &payload)?;
+                            agent_events::activity(app, agent_run_id, event)?;
+                            drop(conn);
+
+                            let msg = format!(
+                                "Test-fix budget exhausted: {attempts} fix attempts (cap {}), tests still failing — \
+                                 stopping so a human can look rather than looping indefinitely.",
+                                setup.max_test_fix_attempts
+                            );
+                            finish_run(
+                                app,
+                                agent_run_id,
+                                AgentRunStatus::Stopped,
+                                Some(AgentRunStopReason::TestFixBudgetExhausted),
+                                None,
+                                Some(&msg),
+                            )?;
+                            return Ok(());
+                        }
+                    }
+
                     if consecutive_tool_errors >= MAX_CONSECUTIVE_TOOL_ERRORS {
                         let msg = format!(
                             "{MAX_CONSECUTIVE_TOOL_ERRORS} consecutive tool calls failed — stopping rather than looping."

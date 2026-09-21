@@ -51,6 +51,18 @@ function formatActivitySummary(payloadJson: string): string {
     if (parsed.toolName === "send_message" && typeof parsed.output === "string") {
       return `Message: ${parsed.output}`;
     }
+    // M13: the self-healing test-fix cycle's own activity entries — see
+    // `agent::tool_loop::test_fix_event_payload` for the payload shapes.
+    if (parsed.phase === "failed" && typeof parsed.attempt === "number") {
+      return `Attempt ${parsed.attempt}: tests failed → agent is investigating`;
+    }
+    if (parsed.phase === "retested" && typeof parsed.attempt === "number") {
+      return `Attempt ${parsed.attempt}: retest ${parsed.passed ? "passed" : "still failing"}`;
+    }
+    if (parsed.phase === "budget_exhausted" && typeof parsed.attempts === "number") {
+      const plural = parsed.attempts === 1 ? "" : "s";
+      return `Test-fix budget exhausted after ${parsed.attempts} attempt${plural} (cap ${parsed.cap}) — tests still failing; stopping for a human to look.`;
+    }
     if (typeof parsed.text === "string" && parsed.text.trim().length > 0) return parsed.text;
     if (typeof parsed.summary === "string") return parsed.summary;
     if (typeof parsed.errorMessage === "string" && parsed.errorMessage) return parsed.errorMessage;

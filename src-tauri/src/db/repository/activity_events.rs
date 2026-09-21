@@ -18,6 +18,7 @@ fn event_type_str(event_type: ActivityEventType) -> &'static str {
         ActivityEventType::RunCompleted => "run_completed",
         ActivityEventType::RunStopped => "run_stopped",
         ActivityEventType::Error => "error",
+        ActivityEventType::TestFixCycle => "test_fix_cycle",
     }
 }
 
@@ -29,6 +30,7 @@ fn parse_event_type(s: &str) -> ActivityEventType {
         "run_completed" => ActivityEventType::RunCompleted,
         "run_stopped" => ActivityEventType::RunStopped,
         "error" => ActivityEventType::Error,
+        "test_fix_cycle" => ActivityEventType::TestFixCycle,
         _ => ActivityEventType::RunStarted,
     }
 }
