@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::db::models::Task;
-use crate::db::repository::{agent_messages as agent_messages_repo, tasks as tasks_repo};
+use crate::db::models::{Task, TestRunKind, TestRunStatus};
+use crate::db::repository::{agent_messages as agent_messages_repo, tasks as tasks_repo, test_runs as test_runs_repo};
 use crate::db::DbPool;
 use crate::git::GitService;
 use crate::os_adapter::OperatingSystemAdapter;
@@ -59,24 +59,38 @@ pub struct ToolContext<'a> {
     pub mission_context: Option<MissionContext>,
     /// M11: pooled DB access for `send_message` to look up the mission's
     /// other tasks (to resolve `to_task_title`) and persist the
-    /// `agent_messages` row. Every other tool here is DB-free.
+    /// `agent_messages` row. M13 also uses it (via `test_runs_repo`) so an
+    /// agent's `run_tests` call persists a real `test_runs` row the same way
+    /// a manual Testing-tab run does. Every other tool here is DB-free.
     pub db_pool: DbPool,
+    /// M13: the run's owning project — needed only to record `run_tests`
+    /// calls into `test_runs` (a project-scoped table, like the Testing
+    /// tab's manual runs).
+    pub project_id: String,
 }
 
 /// What running one tool call produced.
 pub enum ToolRunOutcome {
     /// A normal `tool_result` to send back to the model.
-    Result { output: String, is_error: bool },
+    Result {
+        output: String,
+        is_error: bool,
+        /// M13: the `test_runs` row id this call persisted, if it was a
+        /// `run_tests` call — `None` for every other tool, and also `None`
+        /// for `run_tests` if the DB write itself failed (best-effort: a DB
+        /// hiccup here must never block the actual test run).
+        test_run_id: Option<String>,
+    },
     /// `report_completion` was called — ends the run instead of looping.
     Completion { summary: String, success: bool },
 }
 
 fn ok(output: impl Into<String>) -> ToolRunOutcome {
-    ToolRunOutcome::Result { output: output.into(), is_error: false }
+    ToolRunOutcome::Result { output: output.into(), is_error: false, test_run_id: None }
 }
 
 fn err(output: impl Into<String>) -> ToolRunOutcome {
-    ToolRunOutcome::Result { output: output.into(), is_error: true }
+    ToolRunOutcome::Result { output: output.into(), is_error: true, test_run_id: None }
 }
 
 fn require_str<'a>(input: &'a Value, field: &str) -> Result<&'a str, String> {
@@ -100,7 +114,7 @@ pub async fn dispatch_tool(ctx: &ToolContext<'_>, name: &str, input: &Value) -> 
         "search_files" => search_files(ctx, input),
         "search_code" => search_code(ctx, input),
         "run_command" => run_command_tool(ctx, input).await,
-        "run_tests" => run_configured_command(ctx, ctx.test_command.clone(), "test").await,
+        "run_tests" => run_tests_tool(ctx).await,
         "run_linter" => run_configured_command(ctx, ctx.lint_command.clone(), "lint").await,
         "run_build" => run_configured_command(ctx, ctx.build_command.clone(), "build").await,
         "git_status" => git_status(ctx),
@@ -403,18 +417,29 @@ fn search_code(ctx: &ToolContext<'_>, input: &Value) -> ToolRunOutcome {
 // ---------------------------------------------------------------------
 
 async fn run_shell(ctx: &ToolContext<'_>, command: &str) -> ToolRunOutcome {
+    let (text, is_error, _exit_code) = run_shell_text(ctx, command).await;
+    if is_error { err(text) } else { ok(text) }
+}
+
+/// Same as `run_shell`, but returns the formatted output as a plain
+/// `(text, is_error, exit_code)` tuple instead of a `ToolRunOutcome` —
+/// `run_tests` needs the raw exit code to record a proper
+/// `test_runs.exit_code` (M13), and building its own `ToolRunOutcome::Result`
+/// (to also carry `test_run_id`) is far simpler from three plain values than
+/// from trying to pick apart an already-constructed `ToolRunOutcome`.
+async fn run_shell_text(ctx: &ToolContext<'_>, command: &str) -> (String, bool, Option<i64>) {
     let outcome = process::run_shell_command(ctx.os_adapter, &ctx.workspace_root, command, ctx.tool_timeout, ctx.cancel.clone()).await;
     match outcome {
         process::ProcessOutcome::Cancelled => {
             // `run_shell_command` owns the `Child` until it returns; by the
             // time this branch runs, `kill_on_drop(true)` has already killed
             // the real OS process rather than abandoning it.
-            err("command cancelled: the agent run was stopped".to_string())
+            ("command cancelled: the agent run was stopped".to_string(), true, None)
         }
         process::ProcessOutcome::TimedOut { timeout_ms } => {
-            err(format!("command timed out after {timeout_ms}ms and was killed"))
+            (format!("command timed out after {timeout_ms}ms and was killed"), true, None)
         }
-        process::ProcessOutcome::SpawnFailed(message) => err(message),
+        process::ProcessOutcome::SpawnFailed(message) => (message, true, None),
         process::ProcessOutcome::Finished { stdout, stderr, exit_code, success } => {
             let mut text = format!(
                 "exit code: {}\n",
@@ -426,11 +451,7 @@ async fn run_shell(ctx: &ToolContext<'_>, command: &str) -> ToolRunOutcome {
             if !stderr.is_empty() {
                 text.push_str(&format!("stderr:\n{stderr}\n"));
             }
-            if success {
-                ok(text)
-            } else {
-                err(text)
-            }
+            (text, !success, exit_code.map(i64::from))
         }
     }
 }
@@ -451,6 +472,42 @@ async fn run_configured_command(ctx: &ToolContext<'_>, configured: Option<String
              matching `project.<id>.{kind}_command` setting) first"
         )),
     }
+}
+
+/// `run_tests` specifically (not `run_linter`/`run_build`, out of M13's
+/// scope): runs the project's configured test command exactly like
+/// `run_configured_command` would, but also records it as a real
+/// `test_runs` row — the same table/history `commands::testing_commands`'s
+/// manual "Run tests" button already writes to — so `agent::tool_loop`'s
+/// M13 `test_fix_cycle` activity events can reference an actual persisted
+/// test run rather than duplicating its output. Recording is best-effort:
+/// a DB failure here is logged into the returned `test_run_id` as `None`
+/// and never blocks the actual test command from running or its result
+/// from reaching the model.
+async fn run_tests_tool(ctx: &ToolContext<'_>) -> ToolRunOutcome {
+    let Some(command) = ctx.test_command.clone().filter(|c| !c.trim().is_empty()) else {
+        return err(
+            "no test command configured for this project — set it in the project's Testing tab (or the \
+             matching `project.<id>.test_command` setting) first"
+                .to_string(),
+        );
+    };
+
+    let running_id = match ctx.db_pool.get() {
+        Ok(conn) => test_runs_repo::insert_running(&conn, &ctx.project_id, TestRunKind::Test, &command).ok().map(|r| r.id),
+        Err(_) => None,
+    };
+
+    let (output, is_error, exit_code) = run_shell_text(ctx, &command).await;
+
+    if let Some(id) = &running_id {
+        if let Ok(conn) = ctx.db_pool.get() {
+            let status = if is_error { TestRunStatus::Failure } else { TestRunStatus::Success };
+            let _ = test_runs_repo::complete(&conn, id, status, &output, exit_code);
+        }
+    }
+
+    ToolRunOutcome::Result { output, is_error, test_run_id: running_id }
 }
 
 // ---------------------------------------------------------------------
@@ -700,6 +757,14 @@ mod tests {
     }
 
     fn test_ctx<'a>(workspace_root: PathBuf, git: &'a FakeGitService, os: &'a FakeOsAdapter) -> ToolContext<'a> {
+        test_ctx_with_pool(test_db_pool(), workspace_root, git, os)
+    }
+
+    /// Same as `test_ctx`, but takes an existing pool so a test can seed
+    /// rows (a `projects` row for `run_tests_tool`'s `test_runs` writes,
+    /// say) into the exact same in-memory DB the returned `ToolContext`
+    /// will read/write through.
+    fn test_ctx_with_pool<'a>(pool: DbPool, workspace_root: PathBuf, git: &'a FakeGitService, os: &'a FakeOsAdapter) -> ToolContext<'a> {
         ToolContext {
             workspace_root,
             git_service: git,
@@ -711,7 +776,8 @@ mod tests {
             cancel: CancellationToken::new(),
             agent_run_id: "test-run".to_string(),
             mission_context: None,
-            db_pool: test_db_pool(),
+            db_pool: pool,
+            project_id: "p1".to_string(),
         }
     }
 
@@ -724,7 +790,7 @@ mod tests {
 
         let outcome = dispatch_tool(&ctx, "read_file", &serde_json::json!({"path": "../../../etc/passwd"})).await;
         match outcome {
-            ToolRunOutcome::Result { output, is_error } => {
+            ToolRunOutcome::Result { output, is_error, .. } => {
                 assert!(is_error, "path traversal must come back as a tool error, not succeed");
                 assert!(output.contains(".."));
             }
@@ -744,7 +810,7 @@ mod tests {
 
         let read = dispatch_tool(&ctx, "read_file", &serde_json::json!({"path": "notes/a.txt"})).await;
         match read {
-            ToolRunOutcome::Result { output, is_error } => {
+            ToolRunOutcome::Result { output, is_error, .. } => {
                 assert!(!is_error);
                 assert_eq!(output, "hello");
             }
@@ -762,7 +828,7 @@ mod tests {
 
         let outcome = dispatch_tool(&ctx, "edit_file", &serde_json::json!({"path": "f.txt", "old_string": "foo", "new_string": "baz"})).await;
         match outcome {
-            ToolRunOutcome::Result { is_error, output } => {
+            ToolRunOutcome::Result { is_error, output, .. } => {
                 assert!(is_error);
                 assert!(output.contains("2 times"));
             }
@@ -793,9 +859,68 @@ mod tests {
 
         let outcome = dispatch_tool(&ctx, "run_tests", &serde_json::json!({})).await;
         match outcome {
-            ToolRunOutcome::Result { is_error, output } => {
+            ToolRunOutcome::Result { is_error, output, .. } => {
                 assert!(is_error);
                 assert!(output.contains("no test command configured"));
+            }
+            ToolRunOutcome::Completion { .. } => panic!("unexpected completion"),
+        }
+    }
+
+    /// M13: `run_tests` must persist a real `test_runs` row (the same table
+    /// `commands::testing_commands::run_test_suite`'s manual runs write to)
+    /// and hand its id back as `test_run_id`, so `agent::tool_loop`'s
+    /// `test_fix_cycle` activity events can reference the actual run rather
+    /// than duplicating its output.
+    #[tokio::test]
+    async fn run_tests_persists_a_passing_test_runs_row_and_returns_its_id() {
+        let ws = tempfile::tempdir().unwrap();
+        let git = FakeGitService;
+        let os = FakeOsAdapter;
+        let pool = test_db_pool();
+        {
+            let conn = pool.get().unwrap();
+            conn.execute("INSERT INTO projects (id, name) VALUES ('p1', 'Test')", []).unwrap();
+        }
+        let mut ctx = test_ctx_with_pool(pool.clone(), ws.path().to_path_buf(), &git, &os);
+        ctx.test_command = Some(if cfg!(windows) { "exit 0".to_string() } else { "true".to_string() });
+
+        let outcome = dispatch_tool(&ctx, "run_tests", &serde_json::json!({})).await;
+        match outcome {
+            ToolRunOutcome::Result { is_error, test_run_id, .. } => {
+                assert!(!is_error);
+                let id = test_run_id.expect("run_tests must persist a test_runs row and return its id");
+                let conn = pool.get().unwrap();
+                let run = crate::db::repository::test_runs::get_by_id(&conn, &id).unwrap().expect("test_runs row exists");
+                assert_eq!(run.status, crate::db::models::TestRunStatus::Success);
+                assert_eq!(run.project_id, "p1");
+                assert_eq!(run.kind, crate::db::models::TestRunKind::Test);
+            }
+            ToolRunOutcome::Completion { .. } => panic!("unexpected completion"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_tests_persists_a_failing_test_runs_row_too() {
+        let ws = tempfile::tempdir().unwrap();
+        let git = FakeGitService;
+        let os = FakeOsAdapter;
+        let pool = test_db_pool();
+        {
+            let conn = pool.get().unwrap();
+            conn.execute("INSERT INTO projects (id, name) VALUES ('p1', 'Test')", []).unwrap();
+        }
+        let mut ctx = test_ctx_with_pool(pool.clone(), ws.path().to_path_buf(), &git, &os);
+        ctx.test_command = Some(if cfg!(windows) { "exit 1".to_string() } else { "false".to_string() });
+
+        let outcome = dispatch_tool(&ctx, "run_tests", &serde_json::json!({})).await;
+        match outcome {
+            ToolRunOutcome::Result { is_error, test_run_id, .. } => {
+                assert!(is_error);
+                let id = test_run_id.expect("even a failing run_tests call should still persist a row");
+                let conn = pool.get().unwrap();
+                let run = crate::db::repository::test_runs::get_by_id(&conn, &id).unwrap().expect("test_runs row exists");
+                assert_eq!(run.status, crate::db::models::TestRunStatus::Failure);
             }
             ToolRunOutcome::Completion { .. } => panic!("unexpected completion"),
         }
@@ -844,7 +969,7 @@ mod tests {
 
         let outcome = dispatch_tool(&ctx, "search_files", &serde_json::json!({"pattern": "*.rs"})).await;
         match outcome {
-            ToolRunOutcome::Result { output, is_error } => {
+            ToolRunOutcome::Result { output, is_error, .. } => {
                 assert!(!is_error);
                 assert!(output.contains("thing.rs"));
                 assert!(!output.contains("readme.md"));
@@ -863,7 +988,7 @@ mod tests {
 
         let outcome = dispatch_tool(&ctx, "search_code", &serde_json::json!({"query": "TARGET"})).await;
         match outcome {
-            ToolRunOutcome::Result { output, is_error } => {
+            ToolRunOutcome::Result { output, is_error, .. } => {
                 assert!(!is_error);
                 assert!(output.contains("a.txt:2:"));
             }
@@ -884,7 +1009,7 @@ mod tests {
         let outcome = dispatch_tool(&ctx, "run_command", &serde_json::json!({"command": sleep_command})).await;
         assert!(start.elapsed() < Duration::from_secs(10), "the timeout must actually cut the command short");
         match outcome {
-            ToolRunOutcome::Result { is_error, output } => {
+            ToolRunOutcome::Result { is_error, output, .. } => {
                 assert!(is_error);
                 assert!(output.contains("timed out"));
             }
@@ -905,7 +1030,7 @@ mod tests {
         let outcome = dispatch_tool(&ctx, "run_command", &serde_json::json!({"command": sleep_command})).await;
         assert!(start.elapsed() < Duration::from_secs(10), "cancellation must not wait for the process to finish");
         match outcome {
-            ToolRunOutcome::Result { is_error, output } => {
+            ToolRunOutcome::Result { is_error, output, .. } => {
                 assert!(is_error);
                 assert!(output.contains("cancelled"));
             }
@@ -957,6 +1082,7 @@ mod tests {
             agent_run_id: "run1".to_string(),
             mission_context: Some(MissionContext { mission_id: "m1".to_string(), task_id: "t-sender".to_string() }),
             db_pool: pool,
+            project_id: "p1".to_string(),
         }
     }
 
@@ -970,7 +1096,7 @@ mod tests {
 
         let outcome = dispatch_tool(&ctx, "send_message", &serde_json::json!({"subject": "hi", "body": "body"})).await;
         match outcome {
-            ToolRunOutcome::Result { is_error, output } => {
+            ToolRunOutcome::Result { is_error, output, .. } => {
                 assert!(is_error);
                 assert!(output.contains("mission"), "error should explain why: {output}");
             }
@@ -989,7 +1115,7 @@ mod tests {
 
         let outcome = dispatch_tool(&ctx, "send_message", &serde_json::json!({"subject": "Status", "body": "On track"})).await;
         match outcome {
-            ToolRunOutcome::Result { is_error, output } => {
+            ToolRunOutcome::Result { is_error, output, .. } => {
                 assert!(!is_error, "{output}");
                 assert!(output.contains("broadcast"));
             }
@@ -1082,7 +1208,7 @@ mod tests {
         )
         .await;
         match outcome {
-            ToolRunOutcome::Result { is_error, output } => {
+            ToolRunOutcome::Result { is_error, output, .. } => {
                 assert!(is_error);
                 assert!(output.contains("Nonexistent Task"));
             }

@@ -126,7 +126,12 @@ export interface Agent {
 }
 
 export type AgentRunStatus = "queued" | "running" | "completed" | "failed" | "stopped";
-export type AgentRunStopReason = "completed" | "max_iterations" | "user_stopped" | "error";
+export type AgentRunStopReason =
+  | "completed"
+  | "max_iterations"
+  | "user_stopped"
+  | "error"
+  | "test_fix_budget_exhausted";
 
 export interface AgentRun {
   id: string;
@@ -140,6 +145,8 @@ export interface AgentRun {
   iterationCount: number;
   totalInputTokens: number;
   totalOutputTokens: number;
+  /** M13: the self-healing test-fix cycle's bounded retry counter so far. */
+  testFixAttempts: number;
   startedAt: IsoDateTime | null;
   completedAt: IsoDateTime | null;
 }
@@ -200,7 +207,8 @@ export type ActivityEventType =
   | "tool_call_completed"
   | "run_completed"
   | "run_stopped"
-  | "error";
+  | "error"
+  | "test_fix_cycle";
 
 export interface ActivityEvent {
   id: string;

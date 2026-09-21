@@ -37,6 +37,7 @@ fn stop_reason_str(reason: AgentRunStopReason) -> &'static str {
         AgentRunStopReason::MaxIterations => "max_iterations",
         AgentRunStopReason::UserStopped => "user_stopped",
         AgentRunStopReason::Error => "error",
+        AgentRunStopReason::TestFixBudgetExhausted => "test_fix_budget_exhausted",
     }
 }
 
@@ -46,6 +47,7 @@ fn parse_stop_reason(s: Option<String>) -> Option<AgentRunStopReason> {
         Some("max_iterations") => Some(AgentRunStopReason::MaxIterations),
         Some("user_stopped") => Some(AgentRunStopReason::UserStopped),
         Some("error") => Some(AgentRunStopReason::Error),
+        Some("test_fix_budget_exhausted") => Some(AgentRunStopReason::TestFixBudgetExhausted),
         _ => None,
     }
 }
@@ -65,13 +67,14 @@ fn row_to_agent_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRun> {
         iteration_count: row.get(8)?,
         total_input_tokens: row.get(9)?,
         total_output_tokens: row.get(10)?,
-        started_at: row.get(11)?,
-        completed_at: row.get(12)?,
+        test_fix_attempts: row.get(11)?,
+        started_at: row.get(12)?,
+        completed_at: row.get(13)?,
     })
 }
 
 const SELECT_COLUMNS: &str = "id, agent_id, workspace_id, task_prompt, model_id, status, stop_reason, \
-    error_message, iteration_count, total_input_tokens, total_output_tokens, started_at, completed_at";
+    error_message, iteration_count, total_input_tokens, total_output_tokens, test_fix_attempts, started_at, completed_at";
 
 pub fn get_by_id(conn: &Connection, id: &str) -> AppResult<Option<AgentRun>> {
     conn.query_row(
@@ -102,8 +105,8 @@ pub fn list_for_agent(conn: &Connection, agent_id: &str) -> AppResult<Vec<AgentR
 pub fn insert_queued(conn: &Connection, agent_id: &str, task_prompt: &str, model_id: &str) -> AppResult<AgentRun> {
     let id = Uuid::new_v4().to_string();
     conn.execute(
-        "INSERT INTO agent_runs (id, agent_id, workspace_id, task_prompt, model_id, status, stop_reason, error_message, iteration_count, total_input_tokens, total_output_tokens, started_at, completed_at)
-         VALUES (?1, ?2, NULL, ?3, ?4, 'queued', NULL, NULL, 0, 0, 0, NULL, NULL)",
+        "INSERT INTO agent_runs (id, agent_id, workspace_id, task_prompt, model_id, status, stop_reason, error_message, iteration_count, total_input_tokens, total_output_tokens, test_fix_attempts, started_at, completed_at)
+         VALUES (?1, ?2, NULL, ?3, ?4, 'queued', NULL, NULL, 0, 0, 0, 0, NULL, NULL)",
         params![id, agent_id, task_prompt, model_id],
     )?;
     Ok(AgentRun {
@@ -118,9 +121,20 @@ pub fn insert_queued(conn: &Connection, agent_id: &str, task_prompt: &str, model
         iteration_count: 0,
         total_input_tokens: 0,
         total_output_tokens: 0,
+        test_fix_attempts: 0,
         started_at: None,
         completed_at: None,
     })
+}
+
+/// Mirrors the in-memory `agent::test_fix::TestFixTracker`'s attempt count
+/// onto this run's row — called by `agent::tool_loop` each time a
+/// `run_tests` call changes that count (never incremented directly in SQL,
+/// since the tracker itself is the source of truth for a single, sequential
+/// run).
+pub fn set_test_fix_attempts(conn: &Connection, id: &str, attempts: i64) -> AppResult<()> {
+    conn.execute("UPDATE agent_runs SET test_fix_attempts = ?2 WHERE id = ?1", params![id, attempts])?;
+    Ok(())
 }
 
 /// Links a run to the workspace created for it, once that workspace's own
@@ -251,6 +265,17 @@ mod tests {
         assert_eq!(finished.stop_reason, Some(AgentRunStopReason::Error));
         assert_eq!(finished.error_message.as_deref(), Some("boom"));
         assert!(finished.completed_at.is_some());
+    }
+
+    #[test]
+    fn set_test_fix_attempts_updates_the_stored_count() {
+        let conn = setup_conn();
+        let run = insert_queued(&conn, "a1", "Fix the bug", "claude-sonnet-5").expect("insert_queued");
+        assert_eq!(run.test_fix_attempts, 0);
+
+        set_test_fix_attempts(&conn, &run.id, 2).expect("set_test_fix_attempts");
+        let fetched = get_by_id(&conn, &run.id).expect("get_by_id").expect("exists");
+        assert_eq!(fetched.test_fix_attempts, 2);
     }
 
     #[test]

@@ -23,7 +23,13 @@ use super::tools::{dispatch_tool, elapsed_ms, ToolContext, ToolRunOutcome};
 /// back into the next request's message history — or, for
 /// `report_completion`, to end the run on.
 pub enum ExecutedTool {
-    ToolResult { block: ContentBlockParam, is_error: bool },
+    ToolResult {
+        block: ContentBlockParam,
+        is_error: bool,
+        /// M13: the `test_runs` row id this call persisted, if it was a
+        /// `run_tests` call — see `tools::ToolRunOutcome::Result`.
+        test_run_id: Option<String>,
+    },
     Completion { summary: String, success: bool },
 }
 
@@ -58,7 +64,7 @@ pub async fn run_one_tool_call(
     let duration_ms = elapsed_ms(start);
 
     match outcome {
-        ToolRunOutcome::Result { output, is_error } => {
+        ToolRunOutcome::Result { output, is_error, test_run_id } => {
             let status = if is_error { ToolCallStatus::Error } else { ToolCallStatus::Success };
             let error_message = if is_error { Some(output.as_str()) } else { None };
             let finished_call = {
@@ -77,6 +83,7 @@ pub async fn run_one_tool_call(
             Ok(ExecutedTool::ToolResult {
                 block: ContentBlockParam::ToolResult { tool_use_id: tool_use_id.to_string(), content: output, is_error },
                 is_error,
+                test_run_id,
             })
         }
         ToolRunOutcome::Completion { summary, success } => {

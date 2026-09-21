@@ -14,6 +14,7 @@
 //! - `executor`          — runs one `tool_use` block, persisting/emitting its lifecycle
 //! - `events`            — typed event-emission helpers shared by the loop and executor
 //! - `tool_loop`         — `run_agent_loop`, the actual orchestration
+//! - `test_fix`          — M13: bounded, visible tracking of the self-healing test-fix cycle
 
 pub mod anthropic_client;
 pub mod events;
@@ -21,5 +22,6 @@ pub mod executor;
 pub mod path_guard;
 pub mod process;
 pub mod schema;
+pub mod test_fix;
 pub mod tool_loop;
 pub mod tools;
