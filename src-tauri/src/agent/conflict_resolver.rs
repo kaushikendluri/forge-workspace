@@ -434,7 +434,16 @@ mod tests {
     #[test]
     fn contains_conflict_markers_detects_every_marker_line() {
         assert!(contains_conflict_markers("a\n<<<<<<< HEAD\nb\n=======\nc\n>>>>>>> feature\n"));
-        assert!(contains_conflict_markers("only a ======= divider\n"));
+        // Each marker alone, on its own line, is also detected — a fully
+        // resolved file shouldn't have any of these three lines left,
+        // regardless of which one.
+        assert!(contains_conflict_markers("=======\n"));
+        assert!(contains_conflict_markers("<<<<<<< HEAD\n"));
+        assert!(contains_conflict_markers(">>>>>>> feature\n"));
+        // A line that merely *contains* "=======" somewhere other than at
+        // its start (e.g. quoted in a comment, or indented) is intentionally
+        // not flagged — git's own markers are always at the start of a line.
+        assert!(!contains_conflict_markers("  // this line mentions ======= but isn't a real marker\n"));
         assert!(!contains_conflict_markers("no markers here at all\njust normal text\n"));
     }
 
