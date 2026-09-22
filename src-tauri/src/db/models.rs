@@ -369,6 +369,75 @@ pub struct TestRun {
     pub completed_at: Option<String>,
 }
 
+/// M14: the reviewer agent's own review categories — matches the Phase 4
+/// plan's own category list exactly. Stored (lowercased via
+/// `rename_all = "snake_case"`) as the `category` field inside a `Review`'s
+/// `findings_json`, and as the `submit_review` tool's `category` enum
+/// (`agent::reviewer`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewCategory {
+    Correctness,
+    Security,
+    Performance,
+    Maintainability,
+    Tests,
+    Architecture,
+    Style,
+}
+
+/// M14: how serious one finding is — drives both display (badges) and
+/// `agent::reviewer::should_create_follow_up`'s decision to file a real
+/// follow-up task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewSeverity {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+/// M14: one issue the reviewer found. `file`/`line` are best-effort —
+/// the model may not always pin a finding to an exact location.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewFinding {
+    pub category: ReviewCategory,
+    pub severity: ReviewSeverity,
+    pub summary: String,
+    #[serde(default)]
+    pub file: Option<String>,
+    #[serde(default)]
+    pub line: Option<i64>,
+}
+
+/// M14: a `reviews` row's lifecycle — see `migrations/0008_reviews.sql`'s
+/// own docs for exactly when each value applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewStatus {
+    Pending,
+    Passed,
+    Failed,
+}
+
+/// M14: one reviewer run's persisted result for a completed `agent_runs`
+/// row. `findings_json` is the serialized `Vec<ReviewFinding>` — kept as raw
+/// text at the DB layer (one column, no separate findings table) and parsed
+/// back into a real `Vec<ReviewFinding>` for the `ReviewDto` the frontend
+/// actually consumes (`commands::review_commands`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Review {
+    pub id: String,
+    pub agent_run_id: String,
+    pub score: i64,
+    pub findings_json: String,
+    pub status: ReviewStatus,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Notification {

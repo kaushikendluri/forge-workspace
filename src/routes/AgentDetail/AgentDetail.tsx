@@ -9,18 +9,20 @@ import { useAgentStore } from "@/stores/useAgentStore";
 import { useSettingsStore } from "@/stores/useSettingsStore";
 import {
   getAgentRun,
+  getReview,
   getRunDiff,
   listActivityEvents,
   listAgentRuns,
   listAgents,
   listToolCalls,
+  requestReview,
   startAgentRun,
   stopAgentRun,
 } from "@/lib/tauri";
 import { onForgeEvent } from "@/lib/events";
 import { toastError } from "@/stores/useToastStore";
 import { cn } from "@/lib/utils";
-import type { Agent, AgentRunFileDiffDto, AgentRunStatus, ToolCallStatus } from "@/types/db";
+import type { Agent, AgentRunFileDiffDto, AgentRunStatus, ReviewCategory, ReviewDto, ReviewSeverity, ToolCallStatus } from "@/types/db";
 
 function errorMessage(err: unknown): string {
   if (typeof err === "string") return err;
@@ -41,6 +43,184 @@ const TOOL_CALL_BADGE: Record<ToolCallStatus, { label: string; variant: "default
   success: { label: "success", variant: "success" },
   error: { label: "error", variant: "destructive" },
 };
+
+/** M14: findings are grouped for display in this fixed category order. */
+const REVIEW_CATEGORY_ORDER: ReviewCategory[] = [
+  "correctness",
+  "security",
+  "performance",
+  "maintainability",
+  "tests",
+  "architecture",
+  "style",
+];
+
+const REVIEW_SEVERITY_BADGE: Record<ReviewSeverity, { label: string; variant: "secondary" | "default" | "warning" | "destructive" }> = {
+  low: { label: "low", variant: "secondary" },
+  medium: { label: "medium", variant: "default" },
+  high: { label: "high", variant: "warning" },
+  critical: { label: "critical", variant: "destructive" },
+};
+
+const REVIEW_STATUS_BADGE: Record<ReviewDto["status"], { label: string; variant: "default" | "success" | "destructive" }> = {
+  pending: { label: "Reviewing…", variant: "default" },
+  passed: { label: "Passed", variant: "success" },
+  failed: { label: "Failed", variant: "destructive" },
+};
+
+/**
+ * M14: this run's real reviewer verdict — score, pass/fail status, and
+ * findings grouped by category with a severity badge — plus a "Request
+ * review" action when none has been requested yet. Only meaningful for a
+ * `completed` run (only `completed` runs can be reviewed — see
+ * `agent::reviewer::run_review`'s validation); shows an honest "no review
+ * yet" state rather than fabricating one, and a live "in progress" state
+ * while a `pending` review (manually requested here, or auto-triggered by
+ * the scheduler once a mission task completes) is in flight.
+ */
+function ReviewPanel({ agentRunId }: { agentRunId: string }) {
+  const [review, setReview] = useState<ReviewDto | null | undefined>(undefined);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [isRequesting, setIsRequesting] = useState(false);
+  const [requestError, setRequestError] = useState<string | null>(null);
+
+  const refetch = () => {
+    getReview(agentRunId)
+      .then((result) => setReview(result))
+      .catch((err) => setLoadError(errorMessage(err)));
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    setReview(undefined);
+    setLoadError(null);
+    getReview(agentRunId)
+      .then((result) => {
+        if (!cancelled) setReview(result);
+      })
+      .catch((err) => {
+        if (!cancelled) setLoadError(errorMessage(err));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [agentRunId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    void (async () => {
+      unlisten = await onForgeEvent("review:updated", (payload) => {
+        if (!cancelled && payload.agentRunId === agentRunId) refetch();
+      });
+    })();
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentRunId]);
+
+  const handleRequest = async () => {
+    setIsRequesting(true);
+    setRequestError(null);
+    try {
+      const result = await requestReview(agentRunId);
+      setReview(result);
+    } catch (err) {
+      setRequestError(errorMessage(err));
+    } finally {
+      setIsRequesting(false);
+    }
+  };
+
+  if (loadError) {
+    return (
+      <div className="rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
+        Couldn't load this run's review: {loadError}
+      </div>
+    );
+  }
+  if (review === undefined) {
+    return <p className="text-xs text-muted-foreground">Loading review…</p>;
+  }
+  if (review === null) {
+    return (
+      <div className="flex flex-col gap-2">
+        <p className="text-xs text-muted-foreground">No review requested yet for this run.</p>
+        <div>
+          <Button size="sm" onClick={() => void handleRequest()} disabled={isRequesting}>
+            {isRequesting ? "Requesting review…" : "Request review"}
+          </Button>
+        </div>
+        {requestError && (
+          <div className="rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
+            {requestError}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  if (review.status === "pending") {
+    return <p className="text-xs text-muted-foreground">A real reviewer agent is investigating this change…</p>;
+  }
+
+  const statusBadge = REVIEW_STATUS_BADGE[review.status];
+  const findingsByCategory = new Map<ReviewCategory, typeof review.findings>();
+  for (const finding of review.findings) {
+    const list = findingsByCategory.get(finding.category) ?? [];
+    list.push(finding);
+    findingsByCategory.set(finding.category, list);
+  }
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex items-center gap-2">
+        <span className="text-sm font-medium text-foreground">Score: {review.score}/100</span>
+        <Badge variant={statusBadge.variant}>{statusBadge.label}</Badge>
+        <span className="text-[11px] text-subtle-foreground">{new Date(review.createdAt).toLocaleString()}</span>
+      </div>
+      {review.findings.length === 0 && <p className="text-xs text-muted-foreground">No findings — clean review.</p>}
+      {review.findings.length > 0 && (
+        <div className="flex flex-col gap-2">
+          {REVIEW_CATEGORY_ORDER.filter((category) => findingsByCategory.has(category)).map((category) => (
+            <div key={category} className="flex flex-col gap-1">
+              <h3 className="text-[11px] font-semibold uppercase tracking-wide text-subtle-foreground">{category}</h3>
+              {findingsByCategory.get(category)!.map((finding, i) => {
+                const severityBadge = REVIEW_SEVERITY_BADGE[finding.severity];
+                return (
+                  <div key={i} className="rounded border border-border/60 bg-surface px-2 py-1.5 text-xs">
+                    <div className="flex items-center justify-between gap-2">
+                      <Badge variant={severityBadge.variant}>{severityBadge.label}</Badge>
+                      {finding.file && (
+                        <span className="text-[10px] text-subtle-foreground">
+                          {finding.file}
+                          {finding.line !== null ? `:${finding.line}` : ""}
+                        </span>
+                      )}
+                    </div>
+                    <p className="mt-1 text-muted-foreground">{finding.summary}</p>
+                  </div>
+                );
+              })}
+            </div>
+          ))}
+        </div>
+      )}
+      <div>
+        <Button size="sm" variant="secondary" onClick={() => void handleRequest()} disabled={isRequesting}>
+          {isRequesting ? "Requesting review…" : "Request another review"}
+        </Button>
+      </div>
+      {requestError && (
+        <div className="rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
+          {requestError}
+        </div>
+      )}
+    </div>
+  );
+}
 
 function formatActivitySummary(payloadJson: string): string {
   try {
@@ -445,6 +625,13 @@ export function AgentDetail() {
         <div className="flex min-h-[240px] flex-1 flex-col gap-2 overflow-hidden">
           <h2 className="text-sm font-medium text-foreground">Changes</h2>
           <RunDiffPanel agentRunId={run.id} />
+        </div>
+      )}
+
+      {run.status === "completed" && (
+        <div className="flex flex-col gap-2 overflow-hidden rounded-md border border-border p-3">
+          <h2 className="text-sm font-medium text-foreground">Review</h2>
+          <ReviewPanel agentRunId={run.id} />
         </div>
       )}
     </div>

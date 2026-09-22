@@ -183,6 +183,29 @@ pub fn send_message_tool_definition() -> ToolDefinition {
     )
 }
 
+/// M14: every mutating tool a reviewer run must never be offered — kept as
+/// its own list (rather than defined only implicitly by
+/// [`REVIEWER_TOOL_NAMES`]'s absence) so the exclusion is asserted directly
+/// in `reviewer_tool_list_excludes_every_mutating_tool` below, not just
+/// implied by what a maintainer remembered to leave out of an allowlist.
+const MUTATING_TOOL_NAMES: [&str; 7] =
+    ["write_file", "edit_file", "run_command", "run_tests", "run_linter", "run_build", "report_completion"];
+
+/// M14: the read-only subset of [`all_tool_definitions`] offered to a
+/// reviewer run (`agent::reviewer`) — every tool that only *reads* the
+/// workspace (files, directory listings, code search, git history/diff/
+/// status), none that can mutate it or run arbitrary shell commands, and
+/// not `report_completion` either (a reviewer ends its context-gathering
+/// phase simply by not calling another tool — see `agent::reviewer`'s own
+/// docs). Filters the exact same [`ToolDefinition`]s `all_tool_definitions`
+/// builds, rather than a hand-maintained separate list, so a tool's schema
+/// can never drift between a normal run and a reviewer run.
+const REVIEWER_TOOL_NAMES: [&str; 6] = ["read_file", "list_directory", "search_code", "git_diff", "git_status", "git_log"];
+
+pub fn reviewer_tool_definitions() -> Vec<ToolDefinition> {
+    all_tool_definitions().into_iter().filter(|d| REVIEWER_TOOL_NAMES.contains(&d.name.as_str())).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,5 +235,38 @@ mod tests {
         assert_eq!(def.input_schema.get("type").and_then(|v| v.as_str()), Some("object"));
         assert!(!def.description.is_empty());
         assert!(!all_tool_definitions().iter().any(|d| d.name == def.name));
+    }
+
+    /// M14's core safety property, verified by construction: a reviewer run
+    /// must never be offered a single mutating tool. Checks the actual
+    /// returned list against every name in [`MUTATING_TOOL_NAMES`] (plus
+    /// `send_message`, which is mission-messaging, not read-only either)
+    /// rather than merely trusting [`REVIEWER_TOOL_NAMES`]'s own contents.
+    #[test]
+    fn reviewer_tool_list_excludes_every_mutating_tool() {
+        let reviewer_tools = reviewer_tool_definitions();
+        let reviewer_names: std::collections::HashSet<&str> = reviewer_tools.iter().map(|d| d.name.as_str()).collect();
+
+        for mutating in MUTATING_TOOL_NAMES {
+            assert!(!reviewer_names.contains(mutating), "reviewer tool list must not include '{mutating}'");
+        }
+        assert!(!reviewer_names.contains("send_message"), "reviewer tool list must not include send_message either");
+    }
+
+    #[test]
+    fn reviewer_tool_list_is_exactly_the_read_only_tools() {
+        let reviewer_tools = reviewer_tool_definitions();
+        let mut names: Vec<&str> = reviewer_tools.iter().map(|d| d.name.as_str()).collect();
+        names.sort_unstable();
+        let mut expected: Vec<&str> = REVIEWER_TOOL_NAMES.to_vec();
+        expected.sort_unstable();
+        assert_eq!(names, expected);
+        // Every one of these must also be a real, defined tool (not a typo
+        // that would silently offer nothing) — reuses the exact same
+        // `ToolDefinition`s `all_tool_definitions` builds.
+        for def in &reviewer_tools {
+            assert_eq!(def.input_schema.get("type").and_then(|v| v.as_str()), Some("object"));
+            assert!(!def.description.is_empty());
+        }
     }
 }

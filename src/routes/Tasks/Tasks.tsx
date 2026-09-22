@@ -17,7 +17,16 @@ import {
   stopMission,
 } from "@/lib/tauri";
 import { onForgeEvent } from "@/lib/events";
-import type { AgentMessage, BoardColumn, Mission, MissionStatus, TaskBoardEntryDto, TaskPriority, TaskStatus } from "@/types/db";
+import type {
+  AgentMessage,
+  BoardColumn,
+  Mission,
+  MissionStatus,
+  ReviewStatus,
+  TaskBoardEntryDto,
+  TaskPriority,
+  TaskStatus,
+} from "@/types/db";
 
 function errorMessage(err: unknown): string {
   if (typeof err === "string") return err;
@@ -59,15 +68,21 @@ const TASK_STATUS_BADGE: Record<TaskStatus, { label: string; variant: BadgeVaria
   cancelled: { label: "Cancelled", variant: "secondary" },
 };
 
+/** M14: a task's latest reviewer verdict, if any has ever completed. */
+const REVIEW_STATUS_BADGE: Record<ReviewStatus, { label: string; variant: BadgeVariant }> = {
+  pending: { label: "in progress", variant: "default" },
+  passed: { label: "passed", variant: "success" },
+  failed: { label: "failed", variant: "destructive" },
+};
+
 /**
  * M11: the Kanban board's columns, in display order. `column` on each task
  * is computed backend-side (`list_mission_board` /
  * `orchestrator::scheduler::compute_board_columns`) from the exact same
  * dependency-graph logic the scheduler itself uses to decide what to run
- * next — nothing here re-derives readiness client-side. `review` is never
- * actually populated yet (no reviewer agent exists before Phase 4); it's
- * rendered as an honest, always-empty placeholder rather than left out or
- * faked.
+ * next — nothing here re-derives readiness client-side. M14: `review` is now
+ * genuinely populated — a `done` task sits here while a real reviewer agent
+ * (auto-triggered once the task completes) is still investigating it.
  */
 const BOARD_COLUMNS: { key: BoardColumn; label: string }[] = [
   { key: "backlog", label: "Backlog" },
@@ -405,7 +420,7 @@ function MissionPlanCard({
                 </div>
                 <div className="flex flex-1 flex-col gap-1.5 overflow-y-auto">
                   {items.length === 0 && column.key === "review" && (
-                    <p className="px-0.5 text-[10px] text-subtle-foreground">No reviewer yet (Phase 4).</p>
+                    <p className="px-0.5 text-[10px] text-subtle-foreground">No task is currently being reviewed.</p>
                   )}
                   {items.map((task) => {
                     const taskStatusBadge = TASK_STATUS_BADGE[task.status];
@@ -420,6 +435,12 @@ function MissionPlanCard({
                             {TASK_PRIORITY_BADGE[task.priority].label}
                           </Badge>
                           <Badge variant={taskStatusBadge.variant}>{taskStatusBadge.label}</Badge>
+                          {task.reviewStatus !== null && (
+                            <Badge variant={REVIEW_STATUS_BADGE[task.reviewStatus].variant}>
+                              Review: {REVIEW_STATUS_BADGE[task.reviewStatus].label}
+                              {task.reviewScore !== null ? ` (${task.reviewScore}/100)` : ""}
+                            </Badge>
+                          )}
                         </div>
                         {task.description && <p className="mt-1 text-muted-foreground">{task.description}</p>}
                         {task.dependsOnTaskId && (

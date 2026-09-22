@@ -306,10 +306,10 @@ fn is_terminal_run_status(status: AgentRunStatus) -> bool {
 // ---------------------------------------------------------------------
 
 /// One column of `Tasks.tsx`'s Kanban board. Mirrors `src/types/db.ts`'s
-/// `BoardColumn`. `Review` is never produced by this milestone (no reviewer
-/// agent exists until Phase 4) — it's included only so the frontend can
-/// render an honest, always-empty placeholder column rather than fabricating
-/// one client-side.
+/// `BoardColumn`. M14: `Review` is now genuinely populated — a `done` task
+/// whose agent run has a real `pending` `reviews` row (`agent::reviewer`)
+/// sits here until that review completes, rather than jumping straight to
+/// `Complete`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BoardColumn {
@@ -322,7 +322,9 @@ pub enum BoardColumn {
     Ready,
     Running,
     Blocked,
-    /// Never produced today — see the enum's own docs.
+    /// M14: `done`, with a real reviewer run currently in flight for it
+    /// (`reviews.status = 'pending'`) — see `pending_review_run_ids` on
+    /// [`board_column_for_task`]/[`compute_board_columns`].
     Review,
     Complete,
     Failed,
@@ -332,10 +334,23 @@ pub enum BoardColumn {
 /// Derives one task's board column. Terminal/running statuses map directly;
 /// only `backlog`/`todo` need the graph check (`classify_task`, unchanged
 /// from M9/M10) to distinguish "genuinely not ready yet" from "ready".
-pub fn board_column_for_task(task: &Task, by_id: &HashMap<&str, &Task>) -> BoardColumn {
+/// `pending_review_run_ids` (M14) is the set of `agent_runs.id`s with a
+/// currently-`pending` review (`commands::mission_commands::list_mission_board`
+/// fetches this from the real `reviews` table via
+/// `db::repository::reviews::latest_reviews_for_runs`) — a `done` task whose
+/// run is in that set renders as `Review` instead of `Complete` until the
+/// review finishes.
+pub fn board_column_for_task(task: &Task, by_id: &HashMap<&str, &Task>, pending_review_run_ids: &HashSet<String>) -> BoardColumn {
     match task.status {
         TaskStatus::InProgress => BoardColumn::Running,
-        TaskStatus::Done => BoardColumn::Complete,
+        TaskStatus::Done => {
+            let has_pending_review = task.agent_run_id.as_deref().is_some_and(|id| pending_review_run_ids.contains(id));
+            if has_pending_review {
+                BoardColumn::Review
+            } else {
+                BoardColumn::Complete
+            }
+        }
         TaskStatus::Failed => BoardColumn::Failed,
         TaskStatus::Blocked => BoardColumn::Blocked,
         TaskStatus::Cancelled => BoardColumn::Cancelled,
@@ -350,10 +365,11 @@ pub fn board_column_for_task(task: &Task, by_id: &HashMap<&str, &Task>) -> Board
 /// Computes every task's board column from one snapshot (`by_id` built once
 /// and reused across every task, the same way `evaluate` builds it once for
 /// its own pass). Pure, no I/O — see `commands::mission_commands::
-/// list_mission_board`, the only real caller.
-pub fn compute_board_columns(tasks: &[Task]) -> HashMap<String, BoardColumn> {
+/// list_mission_board`, the only real caller, for where
+/// `pending_review_run_ids` comes from.
+pub fn compute_board_columns(tasks: &[Task], pending_review_run_ids: &HashSet<String>) -> HashMap<String, BoardColumn> {
     let by_id: HashMap<&str, &Task> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
-    tasks.iter().map(|t| (t.id.clone(), board_column_for_task(t, &by_id))).collect()
+    tasks.iter().map(|t| (t.id.clone(), board_column_for_task(t, &by_id, pending_review_run_ids))).collect()
 }
 
 // ---------------------------------------------------------------------
@@ -525,6 +541,30 @@ async fn apply_task_outcome(
         tasks_repo::update_status(&conn, task_id, new_status)?;
     }
     events::mission_task_updated(app, mission_id, task_id, new_status, None)?;
+
+    // M14: once a task reaches `done`, trigger a real reviewer run for its
+    // agent run in the background — fire-and-forget, on purpose: a review
+    // (a handful of real API calls) must never block this driver from
+    // starting the next ready task, and a review failing/erroring (e.g. no
+    // API key configured) must never fail the mission itself — Phase 4's
+    // actual merge/self-healing gating on review outcomes is M15's job, not
+    // this one. See `agent::reviewer::run_review`'s own docs for exactly
+    // what a "reviewer run" does and what happens to a task whose review
+    // comes back `failed` (nothing beyond real follow-up tasks — the task
+    // stays `done`).
+    if new_status == TaskStatus::Done {
+        let agent_run_id = {
+            let conn = get_conn(app)?;
+            tasks_repo::get_by_id(&conn, task_id)?.and_then(|t| t.agent_run_id)
+        };
+        if let Some(agent_run_id) = agent_run_id {
+            let app_for_review = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = crate::agent::reviewer::run_review(&app_for_review, &agent_run_id).await;
+            });
+        }
+    }
+
     Ok(())
 }
 
@@ -1138,7 +1178,7 @@ mod tests {
             task("blocked", TaskStatus::Blocked, 3, None),
             task("cancelled", TaskStatus::Cancelled, 4, None),
         ];
-        let columns = compute_board_columns(&tasks);
+        let columns = compute_board_columns(&tasks, &HashSet::new());
         assert_eq!(columns["running"], BoardColumn::Running);
         assert_eq!(columns["done"], BoardColumn::Complete);
         assert_eq!(columns["failed"], BoardColumn::Failed);
@@ -1150,15 +1190,15 @@ mod tests {
     fn board_column_splits_backlog_into_ready_vs_backlog_by_dependency_state() {
         // No dependency at all -> Ready.
         let no_dep = vec![task("a", TaskStatus::Backlog, 0, None)];
-        assert_eq!(compute_board_columns(&no_dep)["a"], BoardColumn::Ready);
+        assert_eq!(compute_board_columns(&no_dep, &HashSet::new())["a"], BoardColumn::Ready);
 
         // Dependency done -> Ready.
         let dep_done = vec![task("a", TaskStatus::Done, 0, None), task("b", TaskStatus::Backlog, 1, Some("a"))];
-        assert_eq!(compute_board_columns(&dep_done)["b"], BoardColumn::Ready);
+        assert_eq!(compute_board_columns(&dep_done, &HashSet::new())["b"], BoardColumn::Ready);
 
         // Dependency still in flight -> genuinely not ready -> Backlog.
         let dep_waiting = vec![task("a", TaskStatus::Backlog, 0, None), task("b", TaskStatus::Backlog, 1, Some("a"))];
-        assert_eq!(compute_board_columns(&dep_waiting)["b"], BoardColumn::Backlog);
+        assert_eq!(compute_board_columns(&dep_waiting, &HashSet::new())["b"], BoardColumn::Backlog);
     }
 
     #[test]
@@ -1168,13 +1208,15 @@ mod tests {
         // already failed, even before the scheduler's own next pass has
         // written `blocked` to the row.
         let tasks = vec![task("a", TaskStatus::Failed, 0, None), task("b", TaskStatus::Backlog, 1, Some("a"))];
-        assert_eq!(compute_board_columns(&tasks)["b"], BoardColumn::Blocked);
+        assert_eq!(compute_board_columns(&tasks, &HashSet::new())["b"], BoardColumn::Blocked);
     }
 
     #[test]
-    fn board_column_never_produces_review_for_any_real_status() {
-        // Phase 4 scope only — this milestone's board must never fabricate
-        // a task landing in Review.
+    fn board_column_never_produces_review_without_a_pending_review_run_id() {
+        // With an empty `pending_review_run_ids` (no reviewer run currently
+        // in flight for any of these tasks' runs), the board must never
+        // fabricate a task landing in Review — `Done` still maps straight to
+        // `Complete`.
         let tasks = vec![
             task("a", TaskStatus::Backlog, 0, None),
             task("b", TaskStatus::InProgress, 1, None),
@@ -1183,8 +1225,22 @@ mod tests {
             task("e", TaskStatus::Blocked, 4, None),
             task("f", TaskStatus::Cancelled, 5, None),
         ];
-        for column in compute_board_columns(&tasks).values() {
+        for column in compute_board_columns(&tasks, &HashSet::new()).values() {
             assert_ne!(*column, BoardColumn::Review);
         }
+    }
+
+    #[test]
+    fn board_column_is_review_for_a_done_task_with_a_pending_review_run_id() {
+        // M14: a `done` task whose agent run has a currently-`pending`
+        // review sits in Review instead of jumping straight to Complete.
+        let mut done_task = task("a", TaskStatus::Done, 0, None);
+        done_task.agent_run_id = Some("run1".to_string());
+        let other_done_task = task("b", TaskStatus::Done, 1, None); // no agent run at all
+
+        let pending: HashSet<String> = ["run1".to_string()].into_iter().collect();
+        let columns = compute_board_columns(&[done_task, other_done_task], &pending);
+        assert_eq!(columns["a"], BoardColumn::Review);
+        assert_eq!(columns["b"], BoardColumn::Complete);
     }
 }

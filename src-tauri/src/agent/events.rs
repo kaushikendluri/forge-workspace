@@ -6,7 +6,7 @@
 use serde::Serialize;
 use tauri::AppHandle;
 
-use crate::db::models::{ActivityEvent, AgentRunStatus, AgentStatus, Notification, ToolCall};
+use crate::db::models::{ActivityEvent, AgentRunStatus, AgentStatus, Notification, Review, ToolCall};
 use crate::error::AppResult;
 use crate::events;
 
@@ -91,4 +91,19 @@ struct NotificationCreatedPayload {
 /// `TopBar.tsx`'s bell badge updates live without a navigate-away-and-back.
 pub fn notification_created(app: &AppHandle, notification: Notification) -> AppResult<()> {
     events::emit(app, events::NOTIFICATION_CREATED, NotificationCreatedPayload { notification })
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ReviewUpdatedPayload<'a> {
+    agent_run_id: &'a str,
+    review: Review,
+}
+
+/// M14: mirrors `ReviewUpdatedEvent` in `src/types/events.ts` — emitted once
+/// by `agent::reviewer::run_review` right after its `reviews` row reaches a
+/// terminal (`passed`/`failed`) status, so `AgentDetail.tsx`'s review panel
+/// and `Tasks.tsx`'s board update live.
+pub fn review_updated(app: &AppHandle, agent_run_id: &str, review: Review) -> AppResult<()> {
+    events::emit(app, events::REVIEW_UPDATED, ReviewUpdatedPayload { agent_run_id, review })
 }

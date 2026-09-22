@@ -261,19 +261,88 @@ export interface Task {
  * `src-tauri/src/orchestrator/scheduler.rs`'s `BoardColumn` exactly —
  * `column` on `TaskBoardEntryDto` is computed backend-side (from the same
  * dependency-graph logic the scheduler itself uses to decide what to run
- * next), never re-derived in the frontend. `"review"` is never actually
- * produced by the backend today (no reviewer agent exists before Phase 4) —
- * it's an honest, always-empty placeholder column, not a fabricated one.
+ * next), never re-derived in the frontend. M14: `"review"` is now genuinely
+ * populated — a `done` task whose agent run has a currently-`pending`
+ * `reviews` row (`agent::reviewer`, auto-triggered by the scheduler once a
+ * task completes) sits here until that review finishes.
  */
 export type BoardColumn = "backlog" | "ready" | "running" | "blocked" | "review" | "complete" | "failed" | "cancelled";
 
 /**
  * One row of the Kanban board: every `Task` field (flattened) plus its
  * derived `column`. Mirrors `src-tauri/src/commands/mission_commands.rs`'s
- * `TaskBoardEntryDto`, returned by `list_mission_board`.
+ * `TaskBoardEntryDto`, returned by `list_mission_board`. M14:
+ * `reviewScore`/`reviewStatus` mirror the task's agent run's latest review
+ * (if any has ever completed), from the same batched lookup that decides
+ * `column` — `null` when no review was ever requested for this task.
  */
 export interface TaskBoardEntryDto extends Task {
   column: BoardColumn;
+  reviewScore: number | null;
+  reviewStatus: ReviewStatus | null;
+}
+
+/**
+ * M14: the reviewer agent's fixed review categories. Mirrors
+ * `src-tauri/src/db/models.rs`'s `ReviewCategory`.
+ */
+export type ReviewCategory = "correctness" | "security" | "performance" | "maintainability" | "tests" | "architecture" | "style";
+
+/** M14: how serious one finding is. Mirrors `src-tauri/src/db/models.rs`'s `ReviewSeverity`. */
+export type ReviewSeverity = "low" | "medium" | "high" | "critical";
+
+/**
+ * M14: one issue the reviewer found. `file`/`line` are best-effort — the
+ * model may not always pin a finding to an exact location. Mirrors
+ * `src-tauri/src/db/models.rs`'s `ReviewFinding`.
+ */
+export interface ReviewFinding {
+  category: ReviewCategory;
+  severity: ReviewSeverity;
+  summary: string;
+  file: string | null;
+  line: number | null;
+}
+
+/**
+ * M14: a review's lifecycle — `pending` while the reviewer is still
+ * gathering context/producing its verdict, then `passed`/`failed` based on
+ * `agent::reviewer::PASS_THRESHOLD` (70/100). Mirrors
+ * `src-tauri/src/db/models.rs`'s `ReviewStatus`.
+ */
+export type ReviewStatus = "pending" | "passed" | "failed";
+
+/**
+ * M14: a completed reviewer pass for an agent run — score, structured
+ * findings, and pass/fail status. Mirrors
+ * `src-tauri/src/commands/review_commands.rs`'s `ReviewDto`, returned by
+ * `request_review`/`get_review`.
+ */
+export interface ReviewDto {
+  id: string;
+  agentRunId: string;
+  score: number;
+  findings: ReviewFinding[];
+  status: ReviewStatus;
+  createdAt: IsoDateTime;
+}
+
+/**
+ * M14: the raw `reviews` row shape, with `findingsJson` still a serialized
+ * string rather than parsed — this is what `review:updated`'s event payload
+ * actually carries (mirrors `src-tauri/src/db/models.rs`'s `Review`
+ * verbatim), unlike `ReviewDto` (the command-layer shape with `findings`
+ * already parsed). `src/lib/events.ts`/consumers parse `findingsJson`
+ * themselves, the same way `commands::review_commands::to_dto` does
+ * backend-side.
+ */
+export interface Review {
+  id: string;
+  agentRunId: string;
+  score: number;
+  findingsJson: string;
+  status: ReviewStatus;
+  createdAt: IsoDateTime;
 }
 
 export type MissionStatus = "planning" | "plan_ready" | "approved" | "running" | "completed" | "failed" | "stopped";

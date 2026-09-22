@@ -226,7 +226,11 @@ fn test_fix_event_payload(event: &TestFixEvent, test_run_id: Option<&str>) -> St
     }
 }
 
-fn to_content_block_param(block: &AssistantContentBlock) -> ContentBlockParam {
+/// `pub(crate)` (not private) so `agent::reviewer`'s own bounded tool loop
+/// (M14) can fold an `AssistantTurn`'s content blocks back into the next
+/// request's message history the exact same way this loop does, rather than
+/// re-implementing this small conversion.
+pub(crate) fn to_content_block_param(block: &AssistantContentBlock) -> ContentBlockParam {
     match block {
         AssistantContentBlock::Text(text) => ContentBlockParam::Text { text: text.clone() },
         AssistantContentBlock::ToolUse { id, name, input } => {

@@ -11,6 +11,7 @@ import type {
   AgentStatus,
   MissionStatus,
   Notification,
+  Review,
   TaskStatus,
   ToolCall,
 } from "./db";
@@ -66,6 +67,18 @@ export interface MissionTaskUpdatedEvent {
   reason: string | null;
 }
 
+/**
+ * M14: a review for an agent run was created (`pending`) or reached a
+ * terminal status (`passed`/`failed`) — emitted by
+ * `agent::reviewer::run_review`. `review` is the raw row (see `Review`'s own
+ * docs on why it's not the parsed `ReviewDto`); consumers parse
+ * `review.findingsJson` themselves.
+ */
+export interface ReviewUpdatedEvent {
+  agentRunId: string;
+  review: Review;
+}
+
 export interface TerminalOutputEvent {
   terminalId: string;
   chunk: string;
@@ -86,6 +99,7 @@ export interface ForgeEventMap {
   "notification:created": NotificationCreatedEvent;
   "mission:status-changed": MissionStatusChangedEvent;
   "mission:task-updated": MissionTaskUpdatedEvent;
+  "review:updated": ReviewUpdatedEvent;
   "terminal:output": TerminalOutputEvent;
   "terminal:exit": TerminalExitEvent;
 }
