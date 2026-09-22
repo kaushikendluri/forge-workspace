@@ -70,6 +70,17 @@ base64 = "0.22"
 thiserror = "2"
 anyhow = "1"
 
+# Browser automation for the agent's frontend-verification tools (M16) — a
+# pure-Rust Chrome DevTools Protocol client (no bundled Node/Playwright
+# runtime), driving whatever real Chrome/Chromium/Edge binary is actually
+# installed. Runs on the tokio runtime this crate already depends on.
+chromiumoxide = "0.9"
+
+# Lets `browser::BrowserBackend` (M16) be a `dyn`-compatible trait with
+# async methods, mirroring `GitService`/`OperatingSystemAdapter`'s
+# trait-based testability but for genuinely async operations.
+async-trait = "0.1"
+
 [dev-dependencies]
 tempfile = "3"
 

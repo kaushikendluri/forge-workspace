@@ -448,6 +448,13 @@ pub async fn run_review(app: &AppHandle, agent_run_id: &str) -> AppResult<Review
         mission_context: None::<ToolMissionContext>,
         db_pool,
         project_id: agent.project_id.clone(),
+        // The reviewer's tool list never includes a browser_* tool (see
+        // `reviewer_tool_definitions`), so these are never actually
+        // dispatched through — sourced from `AppState` anyway, purely to
+        // satisfy `ToolContext`'s shape, the same way `mission_context` is
+        // always `None` here regardless.
+        browser_manager: app.state::<AppState>().browser_manager.clone(),
+        screenshots_dir: app.state::<AppState>().screenshots_dir.clone(),
     };
 
     let system = context_system_prompt(&agent_run.task_prompt, &workspace.path);

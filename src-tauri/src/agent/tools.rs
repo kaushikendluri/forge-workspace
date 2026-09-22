@@ -10,13 +10,18 @@
 //! of producing a normal tool result.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::db::models::{Task, TestRunKind, TestRunStatus};
-use crate::db::repository::{agent_messages as agent_messages_repo, tasks as tasks_repo, test_runs as test_runs_repo};
+use crate::browser::BrowserManager;
+use crate::db::models::{Task, TestRunKind, TestRunStatus, VisualSnapshotKind};
+use crate::db::repository::{
+    agent_messages as agent_messages_repo, tasks as tasks_repo, test_runs as test_runs_repo,
+    visual_snapshots as visual_snapshots_repo,
+};
 use crate::db::DbPool;
 use crate::git::GitService;
 use crate::os_adapter::OperatingSystemAdapter;
@@ -67,6 +72,15 @@ pub struct ToolContext<'a> {
     /// calls into `test_runs` (a project-scoped table, like the Testing
     /// tab's manual runs).
     pub project_id: String,
+    /// M16: this run's lazily-launched browser session registry — see
+    /// `browser::BrowserManager`'s own docs. Shared (an `Arc`) rather than
+    /// borrowed since it outlives any single `ToolContext`/tool call and is
+    /// also needed by `agent::tool_loop::finish_run`'s cleanup, independent
+    /// of whatever `ToolContext` a given tool call happened to build.
+    pub browser_manager: Arc<BrowserManager>,
+    /// M16: where `browser_screenshot` saves real PNG files — see
+    /// `AppState::screenshots_dir`'s own docs.
+    pub screenshots_dir: PathBuf,
 }
 
 /// What running one tool call produced.
@@ -121,6 +135,10 @@ pub async fn dispatch_tool(ctx: &ToolContext<'_>, name: &str, input: &Value) -> 
         "git_diff" => git_diff(ctx, input),
         "git_log" => git_log(ctx, input),
         "send_message" => send_message(ctx, input),
+        "browser_open" => browser_open(ctx, input).await,
+        "browser_click" => browser_click(ctx, input).await,
+        "browser_type" => browser_type_tool(ctx, input).await,
+        "browser_screenshot" => browser_screenshot_tool(ctx, input).await,
         "report_completion" => report_completion(input),
         other => err(format!("unknown tool '{other}'")),
     }
@@ -655,6 +673,109 @@ fn send_message(ctx: &ToolContext<'_>, input: &Value) -> ToolRunOutcome {
 }
 
 // ---------------------------------------------------------------------
+// Browser tools (M16) — one lazily-launched session per agent run, via
+// `ctx.browser_manager`. Every call is scoped to `ctx.agent_run_id`;
+// `BrowserManager` itself owns the actual session lifecycle (including the
+// "one session per run, closed when the run ends" invariant — see
+// `agent::tool_loop::finish_run`).
+// ---------------------------------------------------------------------
+
+async fn browser_open(ctx: &ToolContext<'_>, input: &Value) -> ToolRunOutcome {
+    let url = match require_str(input, "url") {
+        Ok(u) => u,
+        Err(e) => return err(e),
+    };
+    match ctx.browser_manager.navigate(&ctx.agent_run_id, url).await {
+        Ok(()) => ok(format!("opened '{url}'")),
+        Err(e) => err(e.to_string()),
+    }
+}
+
+async fn browser_click(ctx: &ToolContext<'_>, input: &Value) -> ToolRunOutcome {
+    let selector = match require_str(input, "selector") {
+        Ok(s) => s,
+        Err(e) => return err(e),
+    };
+    match ctx.browser_manager.click(&ctx.agent_run_id, selector).await {
+        Ok(()) => ok(format!("clicked '{selector}'")),
+        Err(e) => err(e.to_string()),
+    }
+}
+
+async fn browser_type_tool(ctx: &ToolContext<'_>, input: &Value) -> ToolRunOutcome {
+    let selector = match require_str(input, "selector") {
+        Ok(s) => s,
+        Err(e) => return err(e),
+    };
+    let text = match require_str(input, "text") {
+        Ok(t) => t,
+        Err(e) => return err(e),
+    };
+    match ctx.browser_manager.type_text(&ctx.agent_run_id, selector, text).await {
+        Ok(()) => ok(format!("typed into '{selector}'")),
+        Err(e) => err(e.to_string()),
+    }
+}
+
+/// Captures a real screenshot via `ctx.browser_manager`, saves it to a new
+/// file under `ctx.screenshots_dir`, and records a `visual_snapshots` row —
+/// `kind` is decided here (`has_baseline_for_label`): the first screenshot
+/// for a given `(run, label)` pair is the baseline, every later one with the
+/// same label is a comparison. Every failure message is specific about
+/// which part already happened (captured/saved to disk vs. not yet
+/// recorded) rather than a bare "failed", since a screenshot genuinely
+/// saved to disk but not yet recorded in the DB is a real (if degraded)
+/// outcome the model should understand, not treated the same as nothing
+/// having happened at all.
+async fn browser_screenshot_tool(ctx: &ToolContext<'_>, input: &Value) -> ToolRunOutcome {
+    let label = input.get("label").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).unwrap_or("default");
+
+    let bytes = match ctx.browser_manager.screenshot(&ctx.agent_run_id).await {
+        Ok(b) => b,
+        Err(e) => return err(e.to_string()),
+    };
+
+    if let Err(e) = std::fs::create_dir_all(&ctx.screenshots_dir) {
+        return err(format!("failed to create the screenshots directory: {e}"));
+    }
+    let file_name = format!("{}-{}.png", ctx.agent_run_id, uuid::Uuid::new_v4());
+    let file_path = ctx.screenshots_dir.join(&file_name);
+    if let Err(e) = std::fs::write(&file_path, &bytes) {
+        return err(format!("failed to save the screenshot to disk: {e}"));
+    }
+    let image_path = file_path.to_string_lossy().into_owned();
+
+    let conn = match ctx.db_pool.get() {
+        Ok(c) => c,
+        Err(e) => {
+            return err(format!(
+                "the screenshot was captured and saved to '{image_path}', but failed to open a database \
+                 connection to record it: {e}"
+            ))
+        }
+    };
+    let task_id = ctx.mission_context.as_ref().map(|m| m.task_id.as_str());
+    let is_baseline = match visual_snapshots_repo::has_baseline_for_label(&conn, &ctx.agent_run_id, label) {
+        Ok(has_one_already) => !has_one_already,
+        Err(e) => {
+            return err(format!(
+                "the screenshot was captured and saved to '{image_path}', but failed to check for an existing \
+                 baseline: {e}"
+            ))
+        }
+    };
+    let kind = if is_baseline { VisualSnapshotKind::Baseline } else { VisualSnapshotKind::Comparison };
+
+    match visual_snapshots_repo::insert(&conn, &ctx.agent_run_id, task_id, label, &image_path, kind) {
+        Ok(_) => ok(format!(
+            "captured a {} screenshot for label '{label}', saved to '{image_path}'",
+            if is_baseline { "baseline" } else { "comparison" }
+        )),
+        Err(e) => err(format!("the screenshot was captured and saved to '{image_path}', but failed to record it: {e}")),
+    }
+}
+
+// ---------------------------------------------------------------------
 // report_completion — ends the run rather than producing a tool_result.
 // ---------------------------------------------------------------------
 
@@ -673,6 +794,7 @@ pub fn elapsed_ms(start: Instant) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::browser::FakeBrowserBackend;
     use crate::git::{BranchInfo, CommitInfo, GitFileDiff, GitStatus, WorktreeInfo};
     use crate::os_adapter::OperatingSystemAdapter;
     use std::collections::HashMap;
@@ -783,6 +905,12 @@ mod tests {
     /// say) into the exact same in-memory DB the returned `ToolContext`
     /// will read/write through.
     fn test_ctx_with_pool<'a>(pool: DbPool, workspace_root: PathBuf, git: &'a FakeGitService, os: &'a FakeOsAdapter) -> ToolContext<'a> {
+        // A subdirectory of the test's own `workspace_root` tempdir, so its
+        // lifetime is tied to whatever `tempfile::TempDir` the caller
+        // already keeps alive for the duration of the test — not a real
+        // production layout (which uses the app-data directory globally),
+        // just a scratch location for these dispatch-logic tests.
+        let screenshots_dir = workspace_root.join(".test-screenshots");
         ToolContext {
             workspace_root,
             git_service: git,
@@ -808,7 +936,25 @@ mod tests {
             mission_context: None,
             db_pool: pool,
             project_id: "p1".to_string(),
+            browser_manager: Arc::new(BrowserManager::new(Arc::new(FakeBrowserBackend::default()))),
+            screenshots_dir,
         }
+    }
+
+    /// Same as `test_ctx_with_pool`, but wires `browser_manager` to a
+    /// `BrowserManager` over the given `backend` (rather than a fresh,
+    /// unobservable `FakeBrowserBackend`) so a test can inspect what the
+    /// browser tools actually called on it afterward.
+    fn test_ctx_with_browser<'a>(
+        pool: DbPool,
+        workspace_root: PathBuf,
+        git: &'a FakeGitService,
+        os: &'a FakeOsAdapter,
+        backend: Arc<FakeBrowserBackend>,
+    ) -> ToolContext<'a> {
+        let mut ctx = test_ctx_with_pool(pool, workspace_root, git, os);
+        ctx.browser_manager = Arc::new(BrowserManager::new(backend));
+        ctx
     }
 
     #[tokio::test]
@@ -1100,6 +1246,7 @@ mod tests {
     }
 
     fn mission_ctx<'a>(pool: DbPool, ws: PathBuf, git: &'a FakeGitService, os: &'a FakeOsAdapter) -> ToolContext<'a> {
+        let screenshots_dir = ws.join(".test-screenshots");
         ToolContext {
             workspace_root: ws,
             git_service: git,
@@ -1114,6 +1261,8 @@ mod tests {
             mission_context: Some(MissionContext { mission_id: "m1".to_string(), task_id: "t-sender".to_string() }),
             db_pool: pool,
             project_id: "p1".to_string(),
+            browser_manager: Arc::new(BrowserManager::new(Arc::new(FakeBrowserBackend::default()))),
+            screenshots_dir,
         }
     }
 
@@ -1294,5 +1443,165 @@ mod tests {
     fn resolve_recipient_errors_for_an_unknown_title() {
         let tasks = vec![task_with_run("t1", "A", Some("run1"))];
         assert!(resolve_recipient_agent_run_id(&tasks, Some("does not exist")).is_err());
+    }
+
+    // -- browser tools (M16) -------------------------------------------------
+
+    #[tokio::test]
+    async fn browser_open_dispatches_navigate_through_the_browser_manager() {
+        let ws = tempfile::tempdir().unwrap();
+        let git = FakeGitService;
+        let os = FakeOsAdapter;
+        let backend = Arc::new(FakeBrowserBackend::default());
+        let ctx = test_ctx_with_browser(test_db_pool(), ws.path().to_path_buf(), &git, &os, backend.clone());
+
+        let outcome = dispatch_tool(&ctx, "browser_open", &serde_json::json!({"url": "https://example.com"})).await;
+        match outcome {
+            ToolRunOutcome::Result { is_error, output, .. } => {
+                assert!(!is_error, "{output}");
+                assert!(output.contains("example.com"));
+            }
+            ToolRunOutcome::Completion { .. } => panic!("browser_open must never end the run"),
+        }
+
+        let navigate_calls = backend.navigate_calls.lock().unwrap();
+        assert_eq!(navigate_calls.len(), 1);
+        assert_eq!(navigate_calls[0].1, "https://example.com");
+    }
+
+    #[tokio::test]
+    async fn browser_click_and_browser_type_dispatch_through_the_browser_manager_and_share_one_session() {
+        let ws = tempfile::tempdir().unwrap();
+        let git = FakeGitService;
+        let os = FakeOsAdapter;
+        let backend = Arc::new(FakeBrowserBackend::default());
+        let ctx = test_ctx_with_browser(test_db_pool(), ws.path().to_path_buf(), &git, &os, backend.clone());
+
+        let click = dispatch_tool(&ctx, "browser_click", &serde_json::json!({"selector": "button.submit"})).await;
+        assert!(matches!(click, ToolRunOutcome::Result { is_error: false, .. }));
+        let typed = dispatch_tool(&ctx, "browser_type", &serde_json::json!({"selector": "input#email", "text": "a@b.com"})).await;
+        assert!(matches!(typed, ToolRunOutcome::Result { is_error: false, .. }));
+
+        let click_calls = backend.click_calls.lock().unwrap();
+        let type_calls = backend.type_calls.lock().unwrap();
+        assert_eq!(click_calls[0].1, "button.submit");
+        assert_eq!((type_calls[0].1.as_str(), type_calls[0].2.as_str()), ("input#email", "a@b.com"));
+        assert_eq!(click_calls[0].0, type_calls[0].0, "both calls in the same run must reuse the same browser session");
+    }
+
+    #[tokio::test]
+    async fn browser_open_surfaces_a_launch_failure_as_a_clear_tool_error() {
+        let ws = tempfile::tempdir().unwrap();
+        let git = FakeGitService;
+        let os = FakeOsAdapter;
+        let backend = Arc::new(FakeBrowserBackend { fail_launch: true, ..Default::default() });
+        let ctx = test_ctx_with_browser(test_db_pool(), ws.path().to_path_buf(), &git, &os, backend);
+
+        let outcome = dispatch_tool(&ctx, "browser_open", &serde_json::json!({"url": "https://example.com"})).await;
+        match outcome {
+            ToolRunOutcome::Result { is_error, output, .. } => {
+                assert!(is_error);
+                assert!(output.contains("Chrome"), "must be the honest 'no browser found' message: {output}");
+            }
+            ToolRunOutcome::Completion { .. } => panic!("unexpected completion"),
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_screenshot_saves_a_real_file_under_screenshots_dir_and_records_a_baseline_row() {
+        let ws = tempfile::tempdir().unwrap();
+        let git = FakeGitService;
+        let os = FakeOsAdapter;
+        let pool = test_db_pool();
+        {
+            let conn = pool.get().unwrap();
+            conn.execute("INSERT INTO projects (id, name) VALUES ('p1', 'Test')", []).unwrap();
+            conn.execute("INSERT INTO repositories (id, project_id, root_path) VALUES ('r1', 'p1', '/tmp/r1')", []).unwrap();
+            conn.execute("INSERT INTO agents (id, project_id, repository_id, name) VALUES ('a1', 'p1', 'r1', 'Bot')", []).unwrap();
+            conn.execute(
+                "INSERT INTO agent_runs (id, agent_id, task_prompt, model_id) VALUES ('test-run', 'a1', 'do it', 'claude-sonnet-5')",
+                [],
+            )
+            .unwrap();
+        }
+        let backend = Arc::new(FakeBrowserBackend { screenshot_bytes: vec![1, 2, 3, 4], ..Default::default() });
+        let ctx = test_ctx_with_browser(pool.clone(), ws.path().to_path_buf(), &git, &os, backend);
+
+        let outcome = dispatch_tool(&ctx, "browser_screenshot", &serde_json::json!({"label": "home"})).await;
+        match outcome {
+            ToolRunOutcome::Result { is_error, output, .. } => assert!(!is_error, "{output}"),
+            ToolRunOutcome::Completion { .. } => panic!("unexpected completion"),
+        }
+
+        let conn = pool.get().unwrap();
+        let rows = crate::db::repository::visual_snapshots::list_for_run(&conn, "test-run").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, "home");
+        assert_eq!(rows[0].kind, crate::db::models::VisualSnapshotKind::Baseline);
+        assert!(
+            std::path::Path::new(&rows[0].image_path).starts_with(&ctx.screenshots_dir),
+            "the saved file must live under ctx.screenshots_dir: {}",
+            rows[0].image_path
+        );
+        let saved_bytes = std::fs::read(&rows[0].image_path).unwrap();
+        assert_eq!(saved_bytes, vec![1, 2, 3, 4], "the file on disk must be exactly what the browser backend captured");
+    }
+
+    #[tokio::test]
+    async fn browser_screenshot_second_call_with_same_label_is_a_comparison_not_another_baseline() {
+        let ws = tempfile::tempdir().unwrap();
+        let git = FakeGitService;
+        let os = FakeOsAdapter;
+        let pool = test_db_pool();
+        {
+            let conn = pool.get().unwrap();
+            conn.execute("INSERT INTO projects (id, name) VALUES ('p1', 'Test')", []).unwrap();
+            conn.execute("INSERT INTO repositories (id, project_id, root_path) VALUES ('r1', 'p1', '/tmp/r1')", []).unwrap();
+            conn.execute("INSERT INTO agents (id, project_id, repository_id, name) VALUES ('a1', 'p1', 'r1', 'Bot')", []).unwrap();
+            conn.execute(
+                "INSERT INTO agent_runs (id, agent_id, task_prompt, model_id) VALUES ('test-run', 'a1', 'do it', 'claude-sonnet-5')",
+                [],
+            )
+            .unwrap();
+        }
+        let backend = Arc::new(FakeBrowserBackend::default());
+        let ctx = test_ctx_with_browser(pool.clone(), ws.path().to_path_buf(), &git, &os, backend);
+
+        dispatch_tool(&ctx, "browser_screenshot", &serde_json::json!({"label": "home"})).await;
+        dispatch_tool(&ctx, "browser_screenshot", &serde_json::json!({"label": "home"})).await;
+
+        let conn = pool.get().unwrap();
+        let rows = crate::db::repository::visual_snapshots::list_for_run(&conn, "test-run").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].kind, crate::db::models::VisualSnapshotKind::Baseline);
+        assert_eq!(rows[1].kind, crate::db::models::VisualSnapshotKind::Comparison);
+    }
+
+    #[tokio::test]
+    async fn browser_screenshot_defaults_label_to_default_when_omitted() {
+        let ws = tempfile::tempdir().unwrap();
+        let git = FakeGitService;
+        let os = FakeOsAdapter;
+        let pool = test_db_pool();
+        {
+            let conn = pool.get().unwrap();
+            conn.execute("INSERT INTO projects (id, name) VALUES ('p1', 'Test')", []).unwrap();
+            conn.execute("INSERT INTO repositories (id, project_id, root_path) VALUES ('r1', 'p1', '/tmp/r1')", []).unwrap();
+            conn.execute("INSERT INTO agents (id, project_id, repository_id, name) VALUES ('a1', 'p1', 'r1', 'Bot')", []).unwrap();
+            conn.execute(
+                "INSERT INTO agent_runs (id, agent_id, task_prompt, model_id) VALUES ('test-run', 'a1', 'do it', 'claude-sonnet-5')",
+                [],
+            )
+            .unwrap();
+        }
+        let backend = Arc::new(FakeBrowserBackend::default());
+        let ctx = test_ctx_with_browser(pool.clone(), ws.path().to_path_buf(), &git, &os, backend);
+
+        dispatch_tool(&ctx, "browser_screenshot", &serde_json::json!({})).await;
+
+        let conn = pool.get().unwrap();
+        let rows = crate::db::repository::visual_snapshots::list_for_run(&conn, "test-run").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, "default");
     }
 }

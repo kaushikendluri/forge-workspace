@@ -507,3 +507,31 @@ export interface MergeResultDto {
   merged: boolean;
   conflicts: ConflictedFile[];
 }
+
+/**
+ * M16: which slot one visual snapshot occupies for its `(agentRunId,
+ * label)` pair — the first `browser_screenshot` call for a given label is
+ * the `"baseline"`; every later one with the same label is a `"comparison"`
+ * against it. Mirrors `src-tauri/src/db/models.rs`'s `VisualSnapshotKind`.
+ */
+export type VisualSnapshotKind = "baseline" | "comparison";
+
+/**
+ * M16: one real PNG screenshot the agent's `browser_screenshot` tool
+ * captured, referenced by its saved file path (fetch the actual bytes via
+ * `getVisualSnapshotImage`). `taskId` is the mission task this run belonged
+ * to, if any. `flagged` is set by the Visual Regression panel's "Reject"
+ * action — an honest marker for a human's attention, not an automatic
+ * revert. Mirrors `src-tauri/src/commands/visual_commands.rs`'s
+ * `VisualSnapshotDto`.
+ */
+export interface VisualSnapshotDto {
+  id: string;
+  agentRunId: string;
+  taskId: string | null;
+  label: string;
+  imagePath: string;
+  kind: VisualSnapshotKind;
+  flagged: boolean;
+  createdAt: IsoDateTime;
+}

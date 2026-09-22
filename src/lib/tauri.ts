@@ -36,6 +36,7 @@ import type {
   TestRun,
   TestRunKind,
   ToolCall,
+  VisualSnapshotDto,
   Workspace,
 } from "@/types/db";
 
@@ -102,6 +103,11 @@ export interface CommandMap {
   merge_agent_run: { args: { agentRunId: string }; result: MergeResultDto };
   abort_agent_run_merge: { args: { agentRunId: string }; result: void };
   resolve_agent_run_merge_conflicts_with_agent: { args: { agentRunId: string }; result: void };
+  list_visual_snapshots: { args: { agentRunId: string }; result: VisualSnapshotDto[] };
+  get_visual_snapshot_image: { args: { snapshotId: string }; result: string };
+  accept_visual_snapshot: { args: { snapshotId: string }; result: void };
+  flag_visual_snapshot: { args: { snapshotId: string }; result: void };
+  create_visual_regression_follow_up_task: { args: { snapshotId: string }; result: Task };
 }
 
 /**
@@ -450,4 +456,37 @@ export async function abortAgentRunMerge(agentRunId: string): Promise<void> {
  */
 export async function resolveAgentRunMergeConflictsWithAgent(agentRunId: string): Promise<void> {
   return invokeCommand("resolve_agent_run_merge_conflicts_with_agent", { agentRunId });
+}
+
+/**
+ * M16: every visual regression snapshot captured so far for `agentRunId`
+ * (via the agent's `browser_screenshot` tool), oldest first — an honest
+ * empty list if the agent never used the browser tools.
+ */
+export async function listVisualSnapshots(agentRunId: string): Promise<VisualSnapshotDto[]> {
+  return invokeCommand("list_visual_snapshots", { agentRunId });
+}
+
+/** M16: the real PNG bytes for one snapshot, base64-encoded, read fresh from disk. */
+export async function getVisualSnapshotImage(snapshotId: string): Promise<string> {
+  return invokeCommand("get_visual_snapshot_image", { snapshotId });
+}
+
+/** M16: "Accept" — promotes a comparison snapshot to be the new baseline for its label. */
+export async function acceptVisualSnapshot(snapshotId: string): Promise<void> {
+  return invokeCommand("accept_visual_snapshot", { snapshotId });
+}
+
+/** M16: "Reject" — flags a snapshot for a human's attention. Never auto-reverts anything. */
+export async function flagVisualSnapshot(snapshotId: string): Promise<void> {
+  return invokeCommand("flag_visual_snapshot", { snapshotId });
+}
+
+/**
+ * M16: "Ask to fix" — files one real follow-up task describing the visual
+ * regression (into the run's mission if it belongs to one, otherwise a
+ * standalone project task) and returns it.
+ */
+export async function createVisualRegressionFollowUpTask(snapshotId: string): Promise<Task> {
+  return invokeCommand("create_visual_regression_follow_up_task", { snapshotId });
 }

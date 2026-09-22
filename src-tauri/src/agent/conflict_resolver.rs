@@ -209,6 +209,12 @@ pub async fn resolve_conflicts_with_agent(app: &AppHandle, agent_run_id: &str) -
         mission_context: None::<ToolMissionContext>,
         db_pool,
         project_id: agent.project_id.clone(),
+        // The conflict resolver's tool list never includes a browser_* tool
+        // (see `conflict_resolver_tool_definitions`) — sourced from
+        // `AppState` purely to satisfy `ToolContext`'s shape, same as
+        // `reviewer::run_review` does.
+        browser_manager: app.state::<AppState>().browser_manager.clone(),
+        screenshots_dir: app.state::<AppState>().screenshots_dir.clone(),
     };
 
     let system = system_prompt(&agent_run.task_prompt, &primary_root, &base_branch, &agent_branch, &initial_conflicts);
@@ -481,6 +487,10 @@ mod tests {
             mission_context: None,
             db_pool: pool,
             project_id: "p1".to_string(),
+            browser_manager: std::sync::Arc::new(crate::browser::BrowserManager::new(std::sync::Arc::new(
+                crate::browser::FakeBrowserBackend::default(),
+            ))),
+            screenshots_dir: ws.path().join(".test-screenshots"),
         };
         let allowed: HashSet<String> = ["allowed.txt".to_string()].into_iter().collect();
 
@@ -527,6 +537,10 @@ mod tests {
             mission_context: None,
             db_pool: pool,
             project_id: "p1".to_string(),
+            browser_manager: std::sync::Arc::new(crate::browser::BrowserManager::new(std::sync::Arc::new(
+                crate::browser::FakeBrowserBackend::default(),
+            ))),
+            screenshots_dir: ws.path().join(".test-screenshots"),
         };
         let allowed: HashSet<String> = HashSet::new();
 

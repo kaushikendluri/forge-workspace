@@ -3,6 +3,7 @@
 //!
 //! Module map:
 //! - `agent`    — the Anthropic tool-calling run loop (M6)
+//! - `browser`  — M16: real browser automation (`chromiumoxide`) behind a testable trait, for the agent's browser_* tools
 //! - `commands` — `#[tauri::command]` functions exposed to the frontend
 //! - `db`       — SQLite pool, migrations, row models, per-table repositories
 //! - `os_adapter` — platform-specific shell/PATH/env behavior
@@ -17,6 +18,7 @@
 //! - `error`    — the app-wide `AppError`/`AppResult` types
 
 pub mod agent;
+pub mod browser;
 pub mod commands;
 pub mod db;
 pub mod error;
@@ -30,9 +32,11 @@ pub mod state;
 pub mod terminal;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use tauri::Manager;
 
+use browser::{BrowserManager, ChromiumoxideBrowserBackend};
 use git::GitCliService;
 use state::AppState;
 
@@ -45,6 +49,19 @@ fn resolve_db_path(app: &tauri::AppHandle) -> PathBuf {
         .app_data_dir()
         .expect("app data dir should be resolvable");
     dir.join("forge-workspace.db")
+}
+
+/// M16: where `agent::tools::browser_screenshot_tool` saves real PNG
+/// screenshots — a `screenshots` subdirectory alongside the SQLite database
+/// itself (see [`resolve_db_path`]), inside the app's own per-app data
+/// directory. Screenshots are real files referenced by path from
+/// `visual_snapshots` rows, never inlined as base64 blobs in SQLite.
+fn resolve_screenshots_dir(app: &tauri::AppHandle) -> PathBuf {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .expect("app data dir should be resolvable");
+    dir.join("screenshots")
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -66,7 +83,15 @@ pub fn run() {
             let os_adapter = os_adapter::current();
             let git_service: Box<dyn git::GitService> = Box::new(GitCliService::new(os_adapter.as_ref()));
 
-            app.manage(AppState::new(pool, os_adapter, git_service));
+            let screenshots_dir = resolve_screenshots_dir(&app.handle());
+            std::fs::create_dir_all(&screenshots_dir)?;
+            // A fresh, independent adapter instance (cheap — see
+            // `agent::tool_loop`'s own comment on doing the same), since
+            // `os_adapter` above is about to be moved into `AppState::new`.
+            let browser_manager =
+                Arc::new(BrowserManager::new(Arc::new(ChromiumoxideBrowserBackend::new(os_adapter::current()))));
+
+            app.manage(AppState::new(pool, os_adapter, git_service, browser_manager, screenshots_dir));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -124,6 +149,11 @@ pub fn run() {
             commands::merge_commands::merge_agent_run,
             commands::merge_commands::abort_agent_run_merge,
             commands::merge_commands::resolve_agent_run_merge_conflicts_with_agent,
+            commands::visual_commands::list_visual_snapshots,
+            commands::visual_commands::get_visual_snapshot_image,
+            commands::visual_commands::accept_visual_snapshot,
+            commands::visual_commands::flag_visual_snapshot,
+            commands::visual_commands::create_visual_regression_follow_up_task,
         ])
         .run(tauri::generate_context!())
         .expect("error while running forge-workspace");
