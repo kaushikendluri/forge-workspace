@@ -400,7 +400,7 @@ pub enum ReviewSeverity {
 
 /// M14: one issue the reviewer found. `file`/`line` are best-effort —
 /// the model may not always pin a finding to an exact location.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewFinding {
     pub category: ReviewCategory,

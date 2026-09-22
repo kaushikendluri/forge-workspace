@@ -1190,15 +1190,15 @@ mod tests {
     fn board_column_splits_backlog_into_ready_vs_backlog_by_dependency_state() {
         // No dependency at all -> Ready.
         let no_dep = vec![task("a", TaskStatus::Backlog, 0, None)];
-        assert_eq!(compute_board_columns(&no_dep)["a"], BoardColumn::Ready);
+        assert_eq!(compute_board_columns(&no_dep, &HashSet::new())["a"], BoardColumn::Ready);
 
         // Dependency done -> Ready.
         let dep_done = vec![task("a", TaskStatus::Done, 0, None), task("b", TaskStatus::Backlog, 1, Some("a"))];
-        assert_eq!(compute_board_columns(&dep_done)["b"], BoardColumn::Ready);
+        assert_eq!(compute_board_columns(&dep_done, &HashSet::new())["b"], BoardColumn::Ready);
 
         // Dependency still in flight -> genuinely not ready -> Backlog.
         let dep_waiting = vec![task("a", TaskStatus::Backlog, 0, None), task("b", TaskStatus::Backlog, 1, Some("a"))];
-        assert_eq!(compute_board_columns(&dep_waiting)["b"], BoardColumn::Backlog);
+        assert_eq!(compute_board_columns(&dep_waiting, &HashSet::new())["b"], BoardColumn::Backlog);
     }
 
     #[test]
@@ -1208,13 +1208,15 @@ mod tests {
         // already failed, even before the scheduler's own next pass has
         // written `blocked` to the row.
         let tasks = vec![task("a", TaskStatus::Failed, 0, None), task("b", TaskStatus::Backlog, 1, Some("a"))];
-        assert_eq!(compute_board_columns(&tasks)["b"], BoardColumn::Blocked);
+        assert_eq!(compute_board_columns(&tasks, &HashSet::new())["b"], BoardColumn::Blocked);
     }
 
     #[test]
-    fn board_column_never_produces_review_for_any_real_status() {
-        // Phase 4 scope only — this milestone's board must never fabricate
-        // a task landing in Review.
+    fn board_column_never_produces_review_without_a_pending_review_run_id() {
+        // With an empty `pending_review_run_ids` (no reviewer run currently
+        // in flight for any of these tasks' runs), the board must never
+        // fabricate a task landing in Review — `Done` still maps straight to
+        // `Complete`.
         let tasks = vec![
             task("a", TaskStatus::Backlog, 0, None),
             task("b", TaskStatus::InProgress, 1, None),
@@ -1223,8 +1225,22 @@ mod tests {
             task("e", TaskStatus::Blocked, 4, None),
             task("f", TaskStatus::Cancelled, 5, None),
         ];
-        for column in compute_board_columns(&tasks).values() {
+        for column in compute_board_columns(&tasks, &HashSet::new()).values() {
             assert_ne!(*column, BoardColumn::Review);
         }
+    }
+
+    #[test]
+    fn board_column_is_review_for_a_done_task_with_a_pending_review_run_id() {
+        // M14: a `done` task whose agent run has a currently-`pending`
+        // review sits in Review instead of jumping straight to Complete.
+        let mut done_task = task("a", TaskStatus::Done, 0, None);
+        done_task.agent_run_id = Some("run1".to_string());
+        let other_done_task = task("b", TaskStatus::Done, 1, None); // no agent run at all
+
+        let pending: HashSet<String> = ["run1".to_string()].into_iter().collect();
+        let columns = compute_board_columns(&[done_task, other_done_task], &pending);
+        assert_eq!(columns["a"], BoardColumn::Review);
+        assert_eq!(columns["b"], BoardColumn::Complete);
     }
 }
