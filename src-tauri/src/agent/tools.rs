@@ -772,7 +772,19 @@ mod tests {
             test_command: None,
             lint_command: None,
             build_command: None,
-            tool_timeout: Duration::from_secs(5),
+            // 20s, not a tight 5s: several tests here spawn a *real* OS shell
+            // (`powershell.exe` on Windows especially has real, sometimes
+            // multi-second, cold-start latency of its own), and CI runners
+            // run the whole test binary's tests concurrently — under CPU
+            // contention from every other test running at once, 5s was
+            // observed to be tight enough to occasionally time out a shell
+            // spawn that would otherwise finish near-instantly, failing the
+            // test with `TimedOut` rather than the real (successful) result.
+            // Tests that specifically exercise the timeout path (see
+            // `run_command_times_out_and_is_killed`) override this field
+            // directly with a much smaller value, so this default being
+            // generous doesn't weaken that coverage at all.
+            tool_timeout: Duration::from_secs(20),
             cancel: CancellationToken::new(),
             agent_run_id: "test-run".to_string(),
             mission_context: None,
@@ -887,8 +899,8 @@ mod tests {
 
         let outcome = dispatch_tool(&ctx, "run_tests", &serde_json::json!({})).await;
         match outcome {
-            ToolRunOutcome::Result { is_error, test_run_id, .. } => {
-                assert!(!is_error);
+            ToolRunOutcome::Result { is_error, output, test_run_id, .. } => {
+                assert!(!is_error, "run_tests unexpectedly failed: {output}");
                 let id = test_run_id.expect("run_tests must persist a test_runs row and return its id");
                 let conn = pool.get().unwrap();
                 let run = crate::db::repository::test_runs::get_by_id(&conn, &id).unwrap().expect("test_runs row exists");
@@ -1077,7 +1089,8 @@ mod tests {
             test_command: None,
             lint_command: None,
             build_command: None,
-            tool_timeout: Duration::from_secs(5),
+            // See `test_ctx_with_pool`'s own comment on this same value.
+            tool_timeout: Duration::from_secs(20),
             cancel: CancellationToken::new(),
             agent_run_id: "run1".to_string(),
             mission_context: Some(MissionContext { mission_id: "m1".to_string(), task_id: "t-sender".to_string() }),
