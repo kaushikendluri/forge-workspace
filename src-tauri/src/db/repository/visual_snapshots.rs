@@ -128,6 +128,11 @@ mod tests {
             [],
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, project_id, title) VALUES ('t1', 'p1', 'Test task')",
+            [],
+        )
+        .unwrap();
         conn
     }
 
