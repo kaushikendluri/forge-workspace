@@ -9,14 +9,19 @@ import { useAgentStore } from "@/stores/useAgentStore";
 import { useSettingsStore } from "@/stores/useSettingsStore";
 import {
   abortAgentRunMerge,
+  acceptVisualSnapshot,
+  createVisualRegressionFollowUpTask,
+  flagVisualSnapshot,
   getAgentRun,
   getMergeReadiness,
   getReview,
   getRunDiff,
+  getVisualSnapshotImage,
   listActivityEvents,
   listAgentRuns,
   listAgents,
   listToolCalls,
+  listVisualSnapshots,
   mergeAgentRun,
   requestReview,
   resolveAgentRunMergeConflictsWithAgent,
@@ -37,6 +42,7 @@ import type {
   ReviewDto,
   ReviewSeverity,
   ToolCallStatus,
+  VisualSnapshotDto,
 } from "@/types/db";
 
 function errorMessage(err: unknown): string {
@@ -423,6 +429,215 @@ function MergePanel({ agentRunId }: { agentRunId: string }) {
 
       {mergeError && (
         <div className="rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-xs text-destructive">{mergeError}</div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * M16: real visual regression snapshots captured by the agent's
+ * `browser_screenshot` tool, grouped by label — baseline vs. each
+ * comparison, with Accept/Reject/Ask-to-fix actions. Shows an honest empty
+ * state rather than fabricating a comparison when the agent never called
+ * `browser_screenshot`. "Accept" promotes a comparison to the new baseline
+ * (a plain DB update); "Reject" only flags it for attention — it never
+ * pretends to auto-revert anything; "Ask to fix" files a real follow-up
+ * task (into the run's mission if it has one, otherwise a standalone
+ * project task).
+ */
+function VisualRegressionPanel({ agentRunId }: { agentRunId: string }) {
+  const [snapshots, setSnapshots] = useState<VisualSnapshotDto[] | null>(null);
+  const [images, setImages] = useState<Record<string, string>>({});
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [followUpTitles, setFollowUpTitles] = useState<Record<string, string>>({});
+
+  const refetch = () => {
+    listVisualSnapshots(agentRunId)
+      .then((result) => setSnapshots(result))
+      .catch((err) => setLoadError(errorMessage(err)));
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    setSnapshots(null);
+    setLoadError(null);
+    listVisualSnapshots(agentRunId)
+      .then((result) => {
+        if (!cancelled) setSnapshots(result);
+      })
+      .catch((err) => {
+        if (!cancelled) setLoadError(errorMessage(err));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [agentRunId]);
+
+  // Lazily fetches each snapshot's real image bytes once its row is known —
+  // a separate round trip per image (rather than inlining bytes into
+  // `listVisualSnapshots`) since a run can accumulate many screenshots and
+  // most views only need to render a handful at a time.
+  useEffect(() => {
+    if (!snapshots || snapshots.length === 0) return;
+    let cancelled = false;
+    void (async () => {
+      for (const snapshot of snapshots) {
+        if (snapshot.id in images) continue;
+        try {
+          const data = await getVisualSnapshotImage(snapshot.id);
+          if (!cancelled) setImages((prev) => ({ ...prev, [snapshot.id]: data }));
+        } catch {
+          // Non-critical — that one image just won't render.
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [snapshots]);
+
+  const handleAccept = async (snapshotId: string) => {
+    setBusyId(snapshotId);
+    setActionError(null);
+    try {
+      await acceptVisualSnapshot(snapshotId);
+      refetch();
+    } catch (err) {
+      setActionError(errorMessage(err));
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const handleReject = async (snapshotId: string) => {
+    setBusyId(snapshotId);
+    setActionError(null);
+    try {
+      await flagVisualSnapshot(snapshotId);
+      refetch();
+    } catch (err) {
+      setActionError(errorMessage(err));
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const handleAskToFix = async (snapshotId: string) => {
+    setBusyId(snapshotId);
+    setActionError(null);
+    try {
+      const task = await createVisualRegressionFollowUpTask(snapshotId);
+      setFollowUpTitles((prev) => ({ ...prev, [snapshotId]: task.title }));
+    } catch (err) {
+      setActionError(errorMessage(err));
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  if (loadError) {
+    return (
+      <div className="rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
+        Couldn't load visual snapshots: {loadError}
+      </div>
+    );
+  }
+  if (snapshots === null) {
+    return <p className="text-xs text-muted-foreground">Loading visual snapshots…</p>;
+  }
+  if (snapshots.length === 0) {
+    return (
+      <p className="text-xs text-muted-foreground">
+        No screenshots captured yet — the agent hasn't used the browser tools for this run.
+      </p>
+    );
+  }
+
+  const byLabel = new Map<string, VisualSnapshotDto[]>();
+  for (const snapshot of snapshots) {
+    const list = byLabel.get(snapshot.label) ?? [];
+    list.push(snapshot);
+    byLabel.set(snapshot.label, list);
+  }
+
+  return (
+    <div className="flex flex-col gap-4">
+      {Array.from(byLabel.entries()).map(([label, group]) => {
+        const baseline = group.find((s) => s.kind === "baseline") ?? null;
+        const comparisons = group.filter((s) => s.kind === "comparison");
+        return (
+          <div key={label} className="flex flex-col gap-2 rounded-md border border-border/60 p-2">
+            <h3 className="text-xs font-semibold text-foreground">{label}</h3>
+            <div className="flex flex-wrap gap-3">
+              {baseline && (
+                <div className="flex flex-col gap-1">
+                  <Badge variant="secondary">Baseline</Badge>
+                  {images[baseline.id] && (
+                    <img
+                      src={`data:image/png;base64,${images[baseline.id]}`}
+                      alt={`${label} baseline`}
+                      className="w-64 rounded border border-border"
+                    />
+                  )}
+                </div>
+              )}
+              {comparisons.length === 0 && (
+                <p className="self-center text-[11px] text-muted-foreground">No comparisons yet for this label.</p>
+              )}
+              {comparisons.map((comparison) => (
+                <div key={comparison.id} className="flex flex-col gap-1">
+                  <div className="flex items-center gap-1.5">
+                    <Badge variant={comparison.flagged ? "warning" : "default"}>
+                      {comparison.flagged ? "Flagged" : "Comparison"}
+                    </Badge>
+                    <span className="text-[10px] text-subtle-foreground">
+                      {new Date(comparison.createdAt).toLocaleTimeString()}
+                    </span>
+                  </div>
+                  {images[comparison.id] && (
+                    <img
+                      src={`data:image/png;base64,${images[comparison.id]}`}
+                      alt={`${label} comparison`}
+                      className="w-64 rounded border border-border"
+                    />
+                  )}
+                  <div className="flex flex-wrap gap-1.5">
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      onClick={() => void handleAccept(comparison.id)}
+                      disabled={busyId === comparison.id}
+                    >
+                      Accept
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="destructive"
+                      onClick={() => void handleReject(comparison.id)}
+                      disabled={busyId === comparison.id}
+                    >
+                      Reject
+                    </Button>
+                    <Button size="sm" onClick={() => void handleAskToFix(comparison.id)} disabled={busyId === comparison.id}>
+                      Ask to fix
+                    </Button>
+                  </div>
+                  {followUpTitles[comparison.id] && (
+                    <p className="max-w-64 text-[11px] text-success">Follow-up task created: {followUpTitles[comparison.id]}</p>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })}
+      {actionError && (
+        <div className="rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
+          {actionError}
+        </div>
       )}
     </div>
   );
@@ -847,6 +1062,11 @@ export function AgentDetail() {
           <MergePanel agentRunId={run.id} />
         </div>
       )}
+
+      <div className="flex flex-col gap-2 overflow-hidden rounded-md border border-border p-3">
+        <h2 className="text-sm font-medium text-foreground">Visual Regression</h2>
+        <VisualRegressionPanel agentRunId={run.id} />
+      </div>
     </div>
   );
 }

@@ -16,4 +16,5 @@ pub mod settings;
 pub mod tasks;
 pub mod test_runs;
 pub mod tool_calls;
+pub mod visual_snapshots;
 pub mod workspaces;

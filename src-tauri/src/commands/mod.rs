@@ -14,6 +14,7 @@ pub mod review_commands;
 pub mod settings_commands;
 pub mod terminal_commands;
 pub mod testing_commands;
+pub mod visual_commands;
 
 use crate::error::AppResult;
 

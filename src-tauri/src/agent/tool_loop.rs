@@ -96,7 +96,8 @@ pub async fn run_agent_loop(app: AppHandle, agent_run_id: String, cancel: Cancel
         // doesn't sit `running` forever; if even that fails there is
         // nothing further this task can do.
         let msg = e.to_string();
-        let _ = finish_run(&app, &agent_run_id, AgentRunStatus::Failed, Some(AgentRunStopReason::Error), Some(msg.clone()), Some(&msg));
+        let _ =
+            finish_run(&app, &agent_run_id, AgentRunStatus::Failed, Some(AgentRunStopReason::Error), Some(msg.clone()), Some(&msg)).await;
     }
 }
 
@@ -327,7 +328,7 @@ fn notification_for_outcome(
 /// (see `notification_for_outcome`) — distinct from `error_message` because
 /// a successful `report_completion` has a summary worth notifying on even
 /// though it isn't an error.
-fn finish_run(
+async fn finish_run(
     app: &AppHandle,
     agent_run_id: &str,
     status: AgentRunStatus,
@@ -335,6 +336,17 @@ fn finish_run(
     error_message: Option<String>,
     notification_detail: Option<&str>,
 ) -> AppResult<()> {
+    // M16: best-effort browser session cleanup — a run that never called a
+    // browser tool has nothing to close (`BrowserManager::close_for_run` is
+    // then a no-op); a real close failure must never block the run from
+    // reaching its terminal DB state below, so it's swallowed rather than
+    // propagated. Called here (not at each of this function's call sites)
+    // so it genuinely runs on *every* terminal path — completed, failed,
+    // stopped, and the top-level unexpected-error path in `run_agent_loop`.
+    if let Some(state) = app.try_state::<AppState>() {
+        let _ = state.browser_manager.close_for_run(agent_run_id).await;
+    }
+
     let agent_id = {
         let conn = get_conn(app)?;
         agent_runs_repo::mark_finished(&conn, agent_run_id, status, stop_reason, error_message.as_deref())?;
@@ -412,7 +424,7 @@ async fn run_agent_loop_inner(app: &AppHandle, agent_run_id: &str, cancel: &Canc
         .map_err(|e| AppError::Other(format!("API key lookup panicked: {e}")))??;
     let Some(api_key) = api_key else {
         let msg = "No Anthropic API key is configured. Add one in Settings, then start this run again.".to_string();
-        finish_run(app, agent_run_id, AgentRunStatus::Failed, Some(AgentRunStopReason::Error), Some(msg.clone()), Some(&msg))?;
+        finish_run(app, agent_run_id, AgentRunStatus::Failed, Some(AgentRunStopReason::Error), Some(msg.clone()), Some(&msg)).await?;
         return Ok(());
     };
 
@@ -441,6 +453,11 @@ async fn run_agent_loop_inner(app: &AppHandle, agent_run_id: &str, cancel: &Canc
         })
     };
     let db_pool = app.state::<AppState>().db.clone();
+    // M16: hoisted once (cheap `Arc`/`PathBuf` clones) rather than re-read
+    // from `AppState` on every `ToolContext` build below, matching
+    // `db_pool`'s own pattern.
+    let browser_manager = app.state::<AppState>().browser_manager.clone();
+    let screenshots_dir = app.state::<AppState>().screenshots_dir.clone();
 
     let client = AnthropicClient::new(api_key)?;
     let mut tool_defs = all_tool_definitions();
@@ -473,7 +490,8 @@ async fn run_agent_loop_inner(app: &AppHandle, agent_run_id: &str, cancel: &Canc
                 Some(AgentRunStopReason::UserStopped),
                 None,
                 Some("Stopped by user request."),
-            )?;
+            )
+            .await?;
             return Ok(());
         }
 
@@ -500,12 +518,14 @@ async fn run_agent_loop_inner(app: &AppHandle, agent_run_id: &str, cancel: &Canc
                     Some(AgentRunStopReason::UserStopped),
                     None,
                     Some("Stopped by user request."),
-                )?;
+                )
+                .await?;
                 return Ok(());
             }
             Err(e) => {
                 let msg = e.to_string();
-                finish_run(app, agent_run_id, AgentRunStatus::Failed, Some(AgentRunStopReason::Error), Some(msg.clone()), Some(&msg))?;
+                finish_run(app, agent_run_id, AgentRunStatus::Failed, Some(AgentRunStopReason::Error), Some(msg.clone()), Some(&msg))
+                    .await?;
                 return Ok(());
             }
         };
@@ -534,7 +554,7 @@ async fn run_agent_loop_inner(app: &AppHandle, agent_run_id: &str, cancel: &Canc
             // refusing to end the run would just spin until max_iterations.
             let text = turn.text();
             let detail = if text.trim().is_empty() { None } else { Some(text.as_str()) };
-            finish_run(app, agent_run_id, AgentRunStatus::Completed, Some(AgentRunStopReason::Completed), None, detail)?;
+            finish_run(app, agent_run_id, AgentRunStatus::Completed, Some(AgentRunStopReason::Completed), None, detail).await?;
             return Ok(());
         }
 
@@ -554,6 +574,8 @@ async fn run_agent_loop_inner(app: &AppHandle, agent_run_id: &str, cancel: &Canc
             mission_context: mission_context.clone(),
             db_pool: db_pool.clone(),
             project_id: setup.agent.project_id.clone(),
+            browser_manager: browser_manager.clone(),
+            screenshots_dir: screenshots_dir.clone(),
         };
 
         let mut tool_results: Vec<ContentBlockParam> = Vec::with_capacity(tool_uses.len());
@@ -568,7 +590,8 @@ async fn run_agent_loop_inner(app: &AppHandle, agent_run_id: &str, cancel: &Canc
                     Some(AgentRunStopReason::UserStopped),
                     None,
                     Some("Stopped by user request."),
-                )?;
+                )
+                .await?;
                 return Ok(());
             }
 
@@ -638,7 +661,8 @@ async fn run_agent_loop_inner(app: &AppHandle, agent_run_id: &str, cancel: &Canc
                                 Some(AgentRunStopReason::TestFixBudgetExhausted),
                                 None,
                                 Some(&msg),
-                            )?;
+                            )
+                            .await?;
                             return Ok(());
                         }
                     }
@@ -654,7 +678,8 @@ async fn run_agent_loop_inner(app: &AppHandle, agent_run_id: &str, cancel: &Canc
                             Some(AgentRunStopReason::Error),
                             Some(msg.clone()),
                             Some(&msg),
-                        )?;
+                        )
+                        .await?;
                         return Ok(());
                     }
                 }
@@ -669,7 +694,7 @@ async fn run_agent_loop_inner(app: &AppHandle, agent_run_id: &str, cancel: &Canc
             let status = if success { AgentRunStatus::Completed } else { AgentRunStatus::Failed };
             let stop_reason = Some(if success { AgentRunStopReason::Completed } else { AgentRunStopReason::Error });
             let error_message = if success { None } else { Some(summary.clone()) };
-            finish_run(app, agent_run_id, status, stop_reason, error_message, Some(&summary))?;
+            finish_run(app, agent_run_id, status, stop_reason, error_message, Some(&summary)).await?;
             return Ok(());
         }
 
@@ -677,6 +702,6 @@ async fn run_agent_loop_inner(app: &AppHandle, agent_run_id: &str, cancel: &Canc
     }
 
     let msg = format!("Reached the maximum of {} iterations without calling report_completion.", setup.max_iterations);
-    finish_run(app, agent_run_id, AgentRunStatus::Stopped, Some(AgentRunStopReason::MaxIterations), None, Some(&msg))?;
+    finish_run(app, agent_run_id, AgentRunStatus::Stopped, Some(AgentRunStopReason::MaxIterations), None, Some(&msg)).await?;
     Ok(())
 }

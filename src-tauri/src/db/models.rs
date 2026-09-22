@@ -438,6 +438,40 @@ pub struct Review {
     pub created_at: String,
 }
 
+/// M16: which slot one `visual_snapshots` row occupies for its
+/// `(agent_run_id, label)` pair — the first `browser_screenshot` call for a
+/// given label is the `Baseline`; every later one with the same label is a
+/// `Comparison` against it. "Accept" (`commands::visual_commands::
+/// accept_visual_snapshot`) promotes a `Comparison` to `Baseline`, demoting
+/// whatever was `Baseline` before it back to `Comparison` — see
+/// `db::repository::visual_snapshots::accept_as_baseline`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VisualSnapshotKind {
+    Baseline,
+    Comparison,
+}
+
+/// M16: one real PNG screenshot the agent's `browser_screenshot` tool
+/// captured (`agent::tools`), referenced by its saved file path — never
+/// inlined as a base64 blob in this table (see
+/// `migrations/0009_visual_snapshots.sql`'s own docs). `task_id` is the
+/// mission task this run belonged to, if any (`None` for a solo run).
+/// `flagged` is set by the Visual Regression panel's "Reject" action — an
+/// honest marker for a human's attention, not an automatic revert.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VisualSnapshot {
+    pub id: String,
+    pub agent_run_id: String,
+    pub task_id: Option<String>,
+    pub label: String,
+    pub image_path: String,
+    pub kind: VisualSnapshotKind,
+    pub flagged: bool,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Notification {

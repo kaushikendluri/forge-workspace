@@ -136,6 +136,56 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
             }),
         ),
         tool(
+            "browser_open",
+            "Launch (if not already running for this run) a real headless browser session and navigate it to \
+             `url`. Useful for verifying frontend changes visually. Fails with a clear error if no Chrome/\
+             Chromium/Edge installation can be found on this machine — never silently no-ops.",
+            json!({
+                "type": "object",
+                "properties": { "url": { "type": "string", "description": "The URL to open." } },
+                "required": ["url"],
+            }),
+        ),
+        tool(
+            "browser_click",
+            "Click the first element matching a CSS selector in this run's browser session (call `browser_open` \
+             first).",
+            json!({
+                "type": "object",
+                "properties": { "selector": { "type": "string", "description": "A CSS selector, e.g. 'button.submit'." } },
+                "required": ["selector"],
+            }),
+        ),
+        tool(
+            "browser_type",
+            "Type text into the first element matching a CSS selector in this run's browser session (call \
+             `browser_open` first).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "selector": { "type": "string", "description": "A CSS selector, e.g. 'input#email'." },
+                    "text": { "type": "string", "description": "The text to type." },
+                },
+                "required": ["selector", "text"],
+            }),
+        ),
+        tool(
+            "browser_screenshot",
+            "Capture a real full-page PNG screenshot of this run's current browser page and save it for visual \
+             regression review (call `browser_open` first). `label` groups screenshots of the same view taken over \
+             time — the first screenshot for a given label becomes its baseline; later screenshots with the same \
+             label are recorded as comparisons against it.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "label": {
+                        "type": "string",
+                        "description": "Groups this screenshot with others of the same view. Defaults to 'default' if omitted.",
+                    },
+                },
+            }),
+        ),
+        tool(
             "report_completion",
             "Call this exactly once, when the task is fully finished (or when it cannot be completed), to \
              end the run. `success` should be false if the task could not be completed.",
@@ -188,8 +238,19 @@ pub fn send_message_tool_definition() -> ToolDefinition {
 /// [`REVIEWER_TOOL_NAMES`]'s absence) so the exclusion is asserted directly
 /// in `reviewer_tool_list_excludes_every_mutating_tool` below, not just
 /// implied by what a maintainer remembered to leave out of an allowlist.
-const MUTATING_TOOL_NAMES: [&str; 7] =
-    ["write_file", "edit_file", "run_command", "run_tests", "run_linter", "run_build", "report_completion"];
+const MUTATING_TOOL_NAMES: [&str; 11] = [
+    "write_file",
+    "edit_file",
+    "run_command",
+    "run_tests",
+    "run_linter",
+    "run_build",
+    "report_completion",
+    "browser_open",
+    "browser_click",
+    "browser_type",
+    "browser_screenshot",
+];
 
 /// M14: the read-only subset of [`all_tool_definitions`] offered to a
 /// reviewer run (`agent::reviewer`) — every tool that only *reads* the
@@ -247,6 +308,33 @@ mod tests {
         );
     }
 
+    /// M16: the browser tools must be part of the main agent's toolset
+    /// (unconditionally, unlike `send_message` — see this module's own
+    /// docs) so a normal M6 run can actually use them, and `browser_open`/
+    /// `browser_screenshot` must have the exact input shape the rest of the
+    /// milestone (`agent::tools`) expects.
+    #[test]
+    fn browser_tools_are_present_in_the_main_tool_list_with_the_expected_input_shape() {
+        let defs = all_tool_definitions();
+        let names: std::collections::HashSet<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        for name in ["browser_open", "browser_click", "browser_type", "browser_screenshot"] {
+            assert!(names.contains(name), "'{name}' must be offered to a normal agent run");
+        }
+
+        let open = defs.iter().find(|d| d.name == "browser_open").unwrap();
+        assert_eq!(
+            open.input_schema.get("required").and_then(|v| v.as_array()).map(|a| a.len()),
+            Some(1),
+            "browser_open must require `url`"
+        );
+
+        let screenshot = defs.iter().find(|d| d.name == "browser_screenshot").unwrap();
+        assert!(
+            screenshot.input_schema.get("required").is_none(),
+            "browser_screenshot's `label` must be optional (defaults to 'default')"
+        );
+    }
+
     #[test]
     fn send_message_tool_definition_is_well_formed_and_distinct() {
         let def = send_message_tool_definition();
@@ -298,7 +386,19 @@ mod tests {
         let tools = conflict_resolver_tool_definitions();
         let names: std::collections::HashSet<&str> = tools.iter().map(|d| d.name.as_str()).collect();
 
-        for excluded in ["write_file", "run_command", "run_tests", "run_linter", "run_build", "report_completion", "send_message"] {
+        for excluded in [
+            "write_file",
+            "run_command",
+            "run_tests",
+            "run_linter",
+            "run_build",
+            "report_completion",
+            "send_message",
+            "browser_open",
+            "browser_click",
+            "browser_type",
+            "browser_screenshot",
+        ] {
             assert!(!names.contains(excluded), "conflict resolver tool list must not include '{excluded}'");
         }
         assert!(names.contains("read_file"));

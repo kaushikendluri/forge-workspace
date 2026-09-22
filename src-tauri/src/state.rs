@@ -2,10 +2,12 @@
 //! via `tauri::State<AppState>` / `AppHandle::state::<AppState>()`.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use tokio_util::sync::CancellationToken;
 
+use crate::browser::BrowserManager;
 use crate::db::DbPool;
 use crate::git::GitService;
 use crate::os_adapter::OperatingSystemAdapter;
@@ -16,6 +18,14 @@ pub struct AppState {
     pub os_adapter: Box<dyn OperatingSystemAdapter>,
     pub git_service: Box<dyn GitService>,
     pub terminals: TerminalManager,
+    /// M16: the per-agent-run browser session registry — see
+    /// `browser::BrowserManager`'s own docs.
+    pub browser_manager: Arc<BrowserManager>,
+    /// M16: where `agent::tools::browser_screenshot_tool` saves real PNG
+    /// screenshots, resolved once alongside `resolve_db_path` in `lib.rs`'s
+    /// `setup` — inside the app's own per-app data directory, never inside
+    /// any agent's worktree.
+    pub screenshots_dir: PathBuf,
     /// Cancellation tokens for every agent run currently executing
     /// (`agent::tool_loop::run_agent_loop`), keyed by `agent_runs.id`.
     /// `start_agent_run` inserts an entry before spawning the loop;
@@ -43,6 +53,8 @@ impl AppState {
         db: DbPool,
         os_adapter: Box<dyn OperatingSystemAdapter>,
         git_service: Box<dyn GitService>,
+        browser_manager: Arc<BrowserManager>,
+        screenshots_dir: PathBuf,
     ) -> Self {
         Self {
             db,
@@ -51,6 +63,8 @@ impl AppState {
             terminals: TerminalManager::new(),
             active_runs: Mutex::new(HashMap::new()),
             active_missions: Mutex::new(HashMap::new()),
+            browser_manager,
+            screenshots_dir,
         }
     }
 }
