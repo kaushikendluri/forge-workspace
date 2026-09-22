@@ -78,6 +78,7 @@ pub struct MergeResultDto {
 /// worktree's own branch — what gets merged *from*. `primary_root` is the
 /// repository's real checkout path (`repositories.root_path`), never the
 /// agent's disposable worktree path.
+#[derive(Debug)]
 struct MergeContext {
     project_id: String,
     primary_root: PathBuf,
