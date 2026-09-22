@@ -47,6 +47,29 @@ pub struct BranchInfo {
     pub is_current: bool,
 }
 
+/// One conflicted path after a failed merge attempt, with git's own raw
+/// two-character `XY` "unmerged" status code from `git status --porcelain=v2`
+/// (`UU` both modified, `AA` both added, `UD`/`DU` deleted on one side, ...) —
+/// shown verbatim rather than translated, since the exact combination matters
+/// for a human (or the M15 conflict resolver) deciding how to resolve it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictedFile {
+    pub path: String,
+    pub status_code: String,
+}
+
+/// The result of a real merge attempt (`GitService::merge_branch`) or a
+/// conflict-detection dry run (`GitService::merge_conflict_dry_run`) — M15.
+/// Deliberately not a `bool` + separate file list: `Conflicts` always carries
+/// the files it found, so a caller can never observe "there was a conflict"
+/// without also knowing which files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeOutcome {
+    Clean,
+    Conflicts(Vec<ConflictedFile>),
+}
+
 /// One entry from `git worktree list --porcelain`, for reconciling the
 /// `workspaces` DB table against what's actually on disk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,6 +168,64 @@ pub trait GitService: Send + Sync {
     /// first. Returns an empty list (rather than erroring) for a repository
     /// with no commits yet.
     fn log(&self, repo_root: &Path, limit: u32) -> AppResult<Vec<CommitInfo>>;
+
+    /// M15: every currently-unmerged path in `repo_root`'s working tree
+    /// (i.e. mid-conflicted-merge), parsed from the exact same
+    /// `git status --porcelain=v2` output `status` already parses — an
+    /// unmerged path always shows up as one of `parse_status`'s `unstaged`
+    /// entries with a **two**-character status code (`UU`, `AA`, `UD`, ...),
+    /// unlike every ordinary staged/unstaged entry (always one character) —
+    /// so this is a thin filter over `status`, not a second parser. Empty
+    /// when there's no merge in progress, or a merge in progress has nothing
+    /// left unresolved.
+    fn conflicted_files(&self, repo_root: &Path) -> AppResult<Vec<ConflictedFile>>;
+
+    /// Performs a **real** merge of `branch` into `into` in the primary
+    /// checkout at `repo_root` (never a worktree — worktrees are disposable
+    /// agent workspaces, per the Phase 4 plan; merges always land in the
+    /// primary checkout): checks out `into` first (surfacing a real git
+    /// error honestly if that fails, e.g. uncommitted local changes — this
+    /// never force-discards anything), then runs
+    /// `git merge --no-ff --no-edit <branch>`. A clean merge is committed
+    /// immediately (`--no-ff` always creates a real merge commit; `--no-edit`
+    /// avoids blocking on an interactive editor) — that's the whole point of
+    /// calling this rather than the dry run. On conflicts, the merge is left
+    /// **in progress** (conflict markers in the working tree, `MERGE_HEAD`
+    /// set) for the caller to resolve (`abort_merge`, or M15's AI conflict
+    /// resolver) — never auto-resolved here.
+    fn merge_branch(&self, repo_root: &Path, branch: &str, into: &str) -> AppResult<MergeOutcome>;
+
+    /// M15's core "detect before doing" mechanism: checks out `into`, then
+    /// runs `git merge --no-commit --no-ff <branch>` and **unconditionally**
+    /// runs `git merge --abort` afterward — regardless of whether the merge
+    /// came back clean or conflicted — before returning. `--no-commit` means
+    /// even a clean merge only stages its result rather than creating a real
+    /// commit, so the trailing `merge --abort` always has something to
+    /// cleanly undo and the repository is left exactly as it was found
+    /// either way. This is how `get_merge_readiness` answers "would this
+    /// conflict?" without ever leaving the primary checkout mid-merge or
+    /// with staged changes, and without ever calling the real,
+    /// commit-producing `merge_branch` speculatively.
+    fn merge_conflict_dry_run(&self, repo_root: &Path, branch: &str, into: &str) -> AppResult<MergeOutcome>;
+
+    /// `git merge --abort` — the honest "back out" path exposed to the user
+    /// when a real (non-dry-run) `merge_branch` left the primary checkout
+    /// conflicted and they don't want to resolve it (manually, or via the AI
+    /// conflict resolver).
+    fn abort_merge(&self, repo_root: &Path) -> AppResult<()>;
+
+    /// Stages exactly `paths` (`git add -- <paths...>`) — used once the AI
+    /// conflict resolver (or a human) has resolved every conflict marker in
+    /// those specific files, deliberately never a blanket `git add -A` that
+    /// could stage unrelated working-tree state.
+    fn stage_paths(&self, repo_root: &Path, paths: &[String]) -> AppResult<()>;
+
+    /// `git commit -m <message>` — finishes an in-progress merge once its
+    /// conflicts have been resolved and staged. Every call site of this in
+    /// M15 (`agent::conflict_resolver`) verifies `conflicted_files` is
+    /// genuinely empty first — this method itself does no such check, it
+    /// just commits whatever's staged.
+    fn commit(&self, repo_root: &Path, message: &str) -> AppResult<()>;
 }
 
 /// `GitService` backed by shelling out to the system `git` binary.
@@ -206,6 +287,27 @@ impl GitCliService {
         } else {
             None
         }
+    }
+
+    /// Like `run`, but hands back the full `Output` (stdout/stderr/exit
+    /// status) regardless of exit code, rather than erroring on a non-zero
+    /// exit — used for `merge`/`merge --no-commit` attempts (M15), where a
+    /// non-zero exit is an *expected*, meaningful outcome (a real conflict)
+    /// the caller needs to distinguish from an actual git error, not
+    /// something to collapse into a generic `Err` the way `run` does.
+    fn run_output(&self, repo_path: &Path, args: &[&str]) -> AppResult<std::process::Output> {
+        Command::new(&self.git_path)
+            .args(args)
+            .current_dir(repo_path)
+            .output()
+            .map_err(|e| {
+                AppError::Other(format!(
+                    "failed to run '{} {}' ({}): {e}",
+                    self.git_path.display(),
+                    args.join(" "),
+                    repo_path.display(),
+                ))
+            })
     }
 }
 
@@ -362,6 +464,96 @@ impl GitService for GitCliService {
             .collect();
 
         Ok(commits)
+    }
+
+    fn conflicted_files(&self, repo_root: &Path) -> AppResult<Vec<ConflictedFile>> {
+        let status = self.status(repo_root)?;
+        Ok(status
+            .unstaged
+            .into_iter()
+            .filter(|e| e.status_code.chars().count() == 2)
+            .map(|e| ConflictedFile { path: e.path, status_code: e.status_code })
+            .collect())
+    }
+
+    fn merge_branch(&self, repo_root: &Path, branch: &str, into: &str) -> AppResult<MergeOutcome> {
+        // Land the merge on `into` regardless of whatever happens to be
+        // checked out already — a real git error here (e.g. uncommitted
+        // local changes blocking the checkout) surfaces honestly rather than
+        // silently merging onto the wrong branch.
+        self.run(repo_root, &["checkout", into])?;
+
+        let output = self.run_output(repo_root, &["merge", "--no-ff", "--no-edit", branch])?;
+        if output.status.success() {
+            return Ok(MergeOutcome::Clean);
+        }
+
+        let conflicts = self.conflicted_files(repo_root)?;
+        if conflicts.is_empty() {
+            // The merge failed for some other real reason (unknown branch,
+            // an unrelated-histories error, ...) — not a conflict, so
+            // there's nothing left mid-merge to report as one. Surface
+            // git's own stderr rather than a generic message.
+            return Err(AppError::Other(merge_failure_message(&output)));
+        }
+        Ok(MergeOutcome::Conflicts(conflicts))
+    }
+
+    fn merge_conflict_dry_run(&self, repo_root: &Path, branch: &str, into: &str) -> AppResult<MergeOutcome> {
+        self.run(repo_root, &["checkout", into])?;
+        let output = self.run_output(repo_root, &["merge", "--no-commit", "--no-ff", branch])?;
+
+        let result = if output.status.success() {
+            Ok(MergeOutcome::Clean)
+        } else {
+            let conflicts = self.conflicted_files(repo_root)?;
+            if conflicts.is_empty() {
+                Err(AppError::Other(merge_failure_message(&output)))
+            } else {
+                Ok(MergeOutcome::Conflicts(conflicts))
+            }
+        };
+
+        // Unconditional, regardless of `result` above — the whole point of
+        // the dry run is that the primary checkout is never left mid-merge
+        // or holding staged changes, whether this came back clean,
+        // conflicted, or erroring for some other reason. Best-effort: if
+        // there was nothing to abort (e.g. the checkout itself never got far
+        // enough to start a merge), this is simply a no-op error that's
+        // deliberately swallowed rather than shadowing the real `result`.
+        let _ = self.run(repo_root, &["merge", "--abort"]);
+        result
+    }
+
+    fn abort_merge(&self, repo_root: &Path) -> AppResult<()> {
+        self.run(repo_root, &["merge", "--abort"]).map(|_| ())
+    }
+
+    fn stage_paths(&self, repo_root: &Path, paths: &[String]) -> AppResult<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let mut args: Vec<&str> = vec!["add", "--"];
+        args.extend(paths.iter().map(String::as_str));
+        self.run(repo_root, &args)?;
+        Ok(())
+    }
+
+    fn commit(&self, repo_root: &Path, message: &str) -> AppResult<()> {
+        self.run(repo_root, &["commit", "-m", message])?;
+        Ok(())
+    }
+}
+
+/// Formats a failed (non-conflict) `git merge`/`git merge --no-commit`
+/// attempt's real stderr into an error message — shared by `merge_branch`
+/// and `merge_conflict_dry_run` so both report a git failure the same way.
+fn merge_failure_message(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.is_empty() {
+        format!("git merge failed (exit {})", output.status)
+    } else {
+        stderr
     }
 }
 
@@ -618,5 +810,146 @@ mod tests {
         // The worktree should still be there since removal was refused.
         let worktrees = service.list_worktrees(repo_dir.path()).expect("list_worktrees");
         assert_eq!(worktrees.len(), 2, "dirty worktree was not removed");
+    }
+
+    // -- M15: merge_branch / merge_conflict_dry_run / abort_merge -----------
+    // Real git, in tempdir repos — same pattern as the worktree tests above.
+
+    /// Creates a real branch off the current `HEAD` and commits `content` to
+    /// `file_name` on it, leaving the repo checked back out on `base_branch`
+    /// afterward (mirroring how a real agent worktree's commits would look
+    /// from the primary checkout's point of view before a merge attempt).
+    fn commit_on_new_branch(service: &GitCliService, repo_dir: &Path, base_branch: &str, branch: &str, file_name: &str, content: &str) {
+        service.run(repo_dir, &["checkout", "-b", branch]).expect("checkout -b");
+        std::fs::write(repo_dir.join(file_name), content).expect("write file");
+        service.run(repo_dir, &["add", "."]).expect("add");
+        service.run(repo_dir, &["commit", "-m", &format!("commit on {branch}")]).expect("commit");
+        service.run(repo_dir, &["checkout", base_branch]).expect("checkout back to base");
+    }
+
+    #[test]
+    fn merge_branch_merges_cleanly_when_changes_do_not_conflict() {
+        let (repo_dir, service, base_branch) = init_test_repo();
+        commit_on_new_branch(&service, repo_dir.path(), &base_branch, "feature", "new-file.txt", "hello from feature\n");
+
+        let outcome = service.merge_branch(repo_dir.path(), "feature", &base_branch).expect("merge_branch should succeed");
+        assert_eq!(outcome, MergeOutcome::Clean);
+
+        // The merge actually landed: the feature branch's file is now on the
+        // base branch, and a real merge commit exists.
+        assert!(repo_dir.path().join("new-file.txt").exists());
+        let log = service.log(repo_dir.path(), 5).expect("log");
+        assert!(log.iter().any(|c| c.subject.to_lowercase().contains("merge")));
+        assert!(service.conflicted_files(repo_dir.path()).expect("conflicted_files").is_empty());
+    }
+
+    #[test]
+    fn merge_branch_detects_a_real_conflict_and_leaves_it_for_the_caller() {
+        let (repo_dir, service, base_branch) = init_test_repo();
+        // Both branches edit the same line of the same file — a genuine
+        // conflict, not a simulated one.
+        std::fs::write(repo_dir.path().join("shared.txt"), "base content\n").expect("write");
+        service.run(repo_dir.path(), &["add", "."]).expect("add");
+        service.run(repo_dir.path(), &["commit", "-m", "add shared.txt"]).expect("commit");
+
+        commit_on_new_branch(&service, repo_dir.path(), &base_branch, "feature", "shared.txt", "feature branch's version\n");
+        std::fs::write(repo_dir.path().join("shared.txt"), "base branch's version\n").expect("write");
+        service.run(repo_dir.path(), &["add", "."]).expect("add");
+        service.run(repo_dir.path(), &["commit", "-m", "diverge on base"]).expect("commit");
+
+        let outcome = service.merge_branch(repo_dir.path(), "feature", &base_branch).expect("merge_branch should return Conflicts, not Err");
+        match outcome {
+            MergeOutcome::Conflicts(files) => {
+                assert_eq!(files.len(), 1);
+                assert_eq!(files[0].path, "shared.txt");
+                assert_eq!(files[0].status_code.chars().count(), 2);
+            }
+            MergeOutcome::Clean => panic!("expected a real conflict"),
+        }
+
+        // The merge is genuinely left in progress — conflict markers are on
+        // disk, and `conflicted_files` (the same status-based detection)
+        // agrees.
+        let on_disk = std::fs::read_to_string(repo_dir.path().join("shared.txt")).expect("read shared.txt");
+        assert!(on_disk.contains("<<<<<<<"));
+        assert_eq!(service.conflicted_files(repo_dir.path()).expect("conflicted_files").len(), 1);
+
+        // abort_merge cleanly backs out, leaving no conflict behind.
+        service.abort_merge(repo_dir.path()).expect("abort_merge");
+        assert!(service.conflicted_files(repo_dir.path()).expect("conflicted_files").is_empty());
+        let on_disk_after_abort = std::fs::read_to_string(repo_dir.path().join("shared.txt")).expect("read shared.txt");
+        assert!(!on_disk_after_abort.contains("<<<<<<<"));
+    }
+
+    #[test]
+    fn merge_conflict_dry_run_detects_conflicts_without_leaving_the_repo_mid_merge() {
+        let (repo_dir, service, base_branch) = init_test_repo();
+        std::fs::write(repo_dir.path().join("shared.txt"), "base content\n").expect("write");
+        service.run(repo_dir.path(), &["add", "."]).expect("add");
+        service.run(repo_dir.path(), &["commit", "-m", "add shared.txt"]).expect("commit");
+
+        commit_on_new_branch(&service, repo_dir.path(), &base_branch, "feature", "shared.txt", "feature branch's version\n");
+        std::fs::write(repo_dir.path().join("shared.txt"), "base branch's version\n").expect("write");
+        service.run(repo_dir.path(), &["add", "."]).expect("add");
+        service.run(repo_dir.path(), &["commit", "-m", "diverge on base"]).expect("commit");
+
+        let outcome =
+            service.merge_conflict_dry_run(repo_dir.path(), "feature", &base_branch).expect("merge_conflict_dry_run should not error");
+        match outcome {
+            MergeOutcome::Conflicts(files) => assert_eq!(files[0].path, "shared.txt"),
+            MergeOutcome::Clean => panic!("expected a real conflict"),
+        }
+
+        // The dry run's whole contract: nothing is left behind — no
+        // mid-merge state, no conflict markers, no staged changes.
+        assert!(service.conflicted_files(repo_dir.path()).expect("conflicted_files").is_empty());
+        let status = service.status(repo_dir.path()).expect("status");
+        assert!(status.staged.is_empty() && status.unstaged.is_empty());
+        let on_disk = std::fs::read_to_string(repo_dir.path().join("shared.txt")).expect("read shared.txt");
+        assert!(!on_disk.contains("<<<<<<<"), "dry run must never leave conflict markers on disk");
+    }
+
+    #[test]
+    fn merge_conflict_dry_run_reports_clean_and_still_leaves_nothing_committed() {
+        let (repo_dir, service, base_branch) = init_test_repo();
+        commit_on_new_branch(&service, repo_dir.path(), &base_branch, "feature", "new-file.txt", "hello\n");
+
+        let outcome = service.merge_conflict_dry_run(repo_dir.path(), "feature", &base_branch).expect("merge_conflict_dry_run");
+        assert_eq!(outcome, MergeOutcome::Clean);
+
+        // Nothing was actually merged — a dry run must never commit.
+        assert!(!repo_dir.path().join("new-file.txt").exists());
+        let log = service.log(repo_dir.path(), 5).expect("log");
+        assert!(!log.iter().any(|c| c.subject.to_lowercase().contains("merge")));
+    }
+
+    #[test]
+    fn stage_paths_then_commit_finishes_a_resolved_merge() {
+        let (repo_dir, service, base_branch) = init_test_repo();
+        std::fs::write(repo_dir.path().join("shared.txt"), "base content\n").expect("write");
+        service.run(repo_dir.path(), &["add", "."]).expect("add");
+        service.run(repo_dir.path(), &["commit", "-m", "add shared.txt"]).expect("commit");
+
+        commit_on_new_branch(&service, repo_dir.path(), &base_branch, "feature", "shared.txt", "feature branch's version\n");
+        std::fs::write(repo_dir.path().join("shared.txt"), "base branch's version\n").expect("write");
+        service.run(repo_dir.path(), &["add", "."]).expect("add");
+        service.run(repo_dir.path(), &["commit", "-m", "diverge on base"]).expect("commit");
+
+        let outcome = service.merge_branch(repo_dir.path(), "feature", &base_branch).expect("merge_branch");
+        assert!(matches!(outcome, MergeOutcome::Conflicts(_)));
+
+        // Resolve it exactly the way the conflict resolver would: overwrite
+        // the file with real, marker-free resolved content.
+        std::fs::write(repo_dir.path().join("shared.txt"), "resolved content\n").expect("write resolved content");
+        assert!(service.conflicted_files(repo_dir.path()).expect("conflicted_files — still unmerged until staged").len() == 1);
+
+        service.stage_paths(repo_dir.path(), &["shared.txt".to_string()]).expect("stage_paths");
+        service.commit(repo_dir.path(), "Merge feature into base — resolved conflicts").expect("commit");
+
+        assert!(service.conflicted_files(repo_dir.path()).expect("conflicted_files").is_empty());
+        let on_disk = std::fs::read_to_string(repo_dir.path().join("shared.txt")).expect("read shared.txt");
+        assert_eq!(on_disk, "resolved content\n");
+        let log = service.log(repo_dir.path(), 5).expect("log");
+        assert!(log.iter().any(|c| c.subject.contains("resolved conflicts")));
     }
 }

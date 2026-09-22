@@ -8,21 +8,36 @@ import { MonacoDiffViewer } from "@/components/diff/MonacoDiffViewer";
 import { useAgentStore } from "@/stores/useAgentStore";
 import { useSettingsStore } from "@/stores/useSettingsStore";
 import {
+  abortAgentRunMerge,
   getAgentRun,
+  getMergeReadiness,
   getReview,
   getRunDiff,
   listActivityEvents,
   listAgentRuns,
   listAgents,
   listToolCalls,
+  mergeAgentRun,
   requestReview,
+  resolveAgentRunMergeConflictsWithAgent,
   startAgentRun,
   stopAgentRun,
 } from "@/lib/tauri";
 import { onForgeEvent } from "@/lib/events";
 import { toastError } from "@/stores/useToastStore";
 import { cn } from "@/lib/utils";
-import type { Agent, AgentRunFileDiffDto, AgentRunStatus, ReviewCategory, ReviewDto, ReviewSeverity, ToolCallStatus } from "@/types/db";
+import type {
+  Agent,
+  AgentRunFileDiffDto,
+  AgentRunStatus,
+  MergeReadinessDto,
+  MergeResultDto,
+  ReadinessCheck,
+  ReviewCategory,
+  ReviewDto,
+  ReviewSeverity,
+  ToolCallStatus,
+} from "@/types/db";
 
 function errorMessage(err: unknown): string {
   if (typeof err === "string") return err;
@@ -217,6 +232,197 @@ function ReviewPanel({ agentRunId }: { agentRunId: string }) {
         <div className="rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
           {requestError}
         </div>
+      )}
+    </div>
+  );
+}
+
+const READINESS_BADGE: Record<ReadinessCheck, { label: string; variant: "secondary" | "success" | "destructive" }> = {
+  not_run: { label: "Not run", variant: "secondary" },
+  passed: { label: "Passed", variant: "success" },
+  failed: { label: "Failed", variant: "destructive" },
+};
+
+function ReadinessRow({ label, check }: { label: string; check: ReadinessCheck }) {
+  const badge = READINESS_BADGE[check];
+  return (
+    <div className="flex items-center justify-between gap-2 text-xs">
+      <span className="text-muted-foreground">{label}</span>
+      <Badge variant={badge.variant}>{badge.label}</Badge>
+    </div>
+  );
+}
+
+/**
+ * M15: a real merge-readiness checklist (tests/build/review/conflicts, all
+ * genuine tri-state signals — never a fabricated checkmark for something
+ * that hasn't actually run) plus the real merge action, with an AI
+ * conflict-resolver fallback and an honest "abort" path when a real merge
+ * attempt conflicts. Only meaningful for a `completed` run, same as
+ * `ReviewPanel`.
+ */
+function MergePanel({ agentRunId }: { agentRunId: string }) {
+  const [readiness, setReadiness] = useState<MergeReadinessDto | undefined>(undefined);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [changedFileCount, setChangedFileCount] = useState<number | null>(null);
+  const [mergeResult, setMergeResult] = useState<MergeResultDto | null>(null);
+  const [isMerging, setIsMerging] = useState(false);
+  const [mergeError, setMergeError] = useState<string | null>(null);
+  const [isResolving, setIsResolving] = useState(false);
+  const [resolveError, setResolveError] = useState<string | null>(null);
+  const [isAborting, setIsAborting] = useState(false);
+
+  const hasApiKey = useSettingsStore((s) => s.hasApiKey);
+
+  const refetchReadiness = () => {
+    getMergeReadiness(agentRunId)
+      .then((result) => setReadiness(result))
+      .catch((err) => setLoadError(errorMessage(err)));
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    setReadiness(undefined);
+    setLoadError(null);
+    setMergeResult(null);
+    getMergeReadiness(agentRunId)
+      .then((result) => {
+        if (!cancelled) setReadiness(result);
+      })
+      .catch((err) => {
+        if (!cancelled) setLoadError(errorMessage(err));
+      });
+    // File count for the "N files changed" stat — reuses the same diff data
+    // `RunDiffPanel` shows, just counted here rather than rendered.
+    getRunDiff(agentRunId)
+      .then((files) => {
+        if (!cancelled) setChangedFileCount(files.length);
+      })
+      .catch(() => {
+        // Non-critical — the checklist itself is what matters here.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [agentRunId]);
+
+  const handleMerge = async () => {
+    setIsMerging(true);
+    setMergeError(null);
+    try {
+      const result = await mergeAgentRun(agentRunId);
+      setMergeResult(result);
+      if (result.merged) refetchReadiness();
+    } catch (err) {
+      setMergeError(errorMessage(err));
+    } finally {
+      setIsMerging(false);
+    }
+  };
+
+  const handleAbort = async () => {
+    setIsAborting(true);
+    setMergeError(null);
+    try {
+      await abortAgentRunMerge(agentRunId);
+      setMergeResult(null);
+      refetchReadiness();
+    } catch (err) {
+      setMergeError(errorMessage(err));
+    } finally {
+      setIsAborting(false);
+    }
+  };
+
+  const handleResolve = async () => {
+    setIsResolving(true);
+    setResolveError(null);
+    try {
+      await resolveAgentRunMergeConflictsWithAgent(agentRunId);
+      setMergeResult({ merged: true, conflicts: [] });
+      refetchReadiness();
+    } catch (err) {
+      setResolveError(errorMessage(err));
+    } finally {
+      setIsResolving(false);
+    }
+  };
+
+  if (loadError) {
+    return (
+      <div className="rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
+        Couldn't check merge readiness: {loadError}
+      </div>
+    );
+  }
+  if (readiness === undefined) {
+    return <p className="text-xs text-muted-foreground">Checking merge readiness…</p>;
+  }
+
+  // A conflict can come from either the live readiness dry run (before any
+  // merge attempt) or a real merge attempt's own result — whichever is more
+  // recent (the merge result, once one exists) wins.
+  const conflicts = mergeResult ? mergeResult.conflicts : readiness.noConflicts === "failed" ? readiness.conflictedFiles : [];
+  const inConflict = conflicts.length > 0;
+  const merged = mergeResult?.merged === true;
+
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="grid grid-cols-2 gap-x-6 gap-y-1 sm:grid-cols-4">
+        <ReadinessRow label="Tests" check={readiness.tests} />
+        <ReadinessRow label="Build" check={readiness.build} />
+        <ReadinessRow label="Review" check={readiness.review} />
+        <ReadinessRow label="No conflicts" check={readiness.noConflicts} />
+      </div>
+      {changedFileCount !== null && (
+        <p className="text-[11px] text-subtle-foreground">
+          {changedFileCount} file{changedFileCount === 1 ? "" : "s"} changed
+        </p>
+      )}
+
+      {merged && (
+        <div className="rounded-md border border-success/40 bg-success/10 px-2 py-1.5 text-xs text-success">
+          Merged successfully into the base branch.
+        </div>
+      )}
+
+      {!merged && inConflict && (
+        <div className="flex flex-col gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-xs">
+          <p className="font-medium text-destructive">
+            Merge conflicts in {conflicts.length} file{conflicts.length === 1 ? "" : "s"}:
+          </p>
+          <ul className="list-inside list-disc text-destructive">
+            {conflicts.map((f) => (
+              <li key={f.path} className="font-mono">
+                {f.path} <span className="text-subtle-foreground">({f.statusCode})</span>
+              </li>
+            ))}
+          </ul>
+          <div className="flex flex-wrap gap-2">
+            {hasApiKey && (
+              <Button size="sm" onClick={() => void handleResolve()} disabled={isResolving || isAborting}>
+                {isResolving ? "Asking agent to resolve…" : "Ask agent to resolve"}
+              </Button>
+            )}
+            <Button size="sm" variant="destructive" onClick={() => void handleAbort()} disabled={isResolving || isAborting}>
+              {isAborting ? "Aborting…" : "Abort merge"}
+            </Button>
+          </div>
+          {resolveError && <p className="text-destructive">{resolveError}</p>}
+        </div>
+      )}
+
+      {!merged && !inConflict && (
+        <div>
+          <Button size="sm" onClick={() => void handleMerge()} disabled={isMerging || !readiness.canMerge}>
+            {isMerging ? "Merging…" : "Merge"}
+          </Button>
+          {!readiness.canMerge && <p className="mt-1 text-[11px] text-subtle-foreground">Resolve conflicts before merging.</p>}
+        </div>
+      )}
+
+      {mergeError && (
+        <div className="rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-xs text-destructive">{mergeError}</div>
       )}
     </div>
   );
@@ -632,6 +838,13 @@ export function AgentDetail() {
         <div className="flex flex-col gap-2 overflow-hidden rounded-md border border-border p-3">
           <h2 className="text-sm font-medium text-foreground">Review</h2>
           <ReviewPanel agentRunId={run.id} />
+        </div>
+      )}
+
+      {run.status === "completed" && (
+        <div className="flex flex-col gap-2 overflow-hidden rounded-md border border-border p-3">
+          <h2 className="text-sm font-medium text-foreground">Merge</h2>
+          <MergePanel agentRunId={run.id} />
         </div>
       )}
     </div>

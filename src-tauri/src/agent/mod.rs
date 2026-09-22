@@ -16,8 +16,10 @@
 //! - `tool_loop`         — `run_agent_loop`, the actual orchestration
 //! - `test_fix`          — M13: bounded, visible tracking of the self-healing test-fix cycle
 //! - `reviewer`          — M14: the read-only reviewer agent (`run_review`)
+//! - `conflict_resolver` — M15: the bounded, scoped AI merge-conflict resolver
 
 pub mod anthropic_client;
+pub mod conflict_resolver;
 pub mod events;
 pub mod executor;
 pub mod path_guard;

@@ -6,6 +6,7 @@ pub mod agent_commands;
 pub mod agent_run_commands;
 pub mod fs_commands;
 pub mod git_commands;
+pub mod merge_commands;
 pub mod mission_commands;
 pub mod notifications_commands;
 pub mod project_commands;

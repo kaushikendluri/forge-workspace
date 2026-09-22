@@ -206,6 +206,25 @@ pub fn reviewer_tool_definitions() -> Vec<ToolDefinition> {
     all_tool_definitions().into_iter().filter(|d| REVIEWER_TOOL_NAMES.contains(&d.name.as_str())).collect()
 }
 
+/// M15: the tool list offered to the bounded AI conflict resolver
+/// (`agent::conflict_resolver`) — narrower even than the reviewer's
+/// read-only set, but for a different reason: this one *can* mutate files
+/// (it has to, to actually resolve conflict markers), so it's scoped instead
+/// to exactly the tools that job needs and nothing more. `read_file`/
+/// `edit_file` to see and fix conflict markers (further restricted, outside
+/// this list, to only the files git itself flagged as conflicted — see
+/// `agent::conflict_resolver`), `git_status`/`git_diff` for orientation. No
+/// `write_file` (it must only edit files git already flagged, never create
+/// new ones), no `run_command`/`run_tests`/`run_linter`/`run_build` (its job
+/// is narrowly resolving conflict markers, not doing general work), and no
+/// `report_completion` (same "just stop calling tools" pattern the
+/// reviewer's context-gathering phase already uses).
+const CONFLICT_RESOLVER_TOOL_NAMES: [&str; 4] = ["read_file", "edit_file", "git_status", "git_diff"];
+
+pub fn conflict_resolver_tool_definitions() -> Vec<ToolDefinition> {
+    all_tool_definitions().into_iter().filter(|d| CONFLICT_RESOLVER_TOOL_NAMES.contains(&d.name.as_str())).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,5 +287,24 @@ mod tests {
             assert_eq!(def.input_schema.get("type").and_then(|v| v.as_str()), Some("object"));
             assert!(!def.description.is_empty());
         }
+    }
+
+    /// M15's core safety property for the conflict resolver's tool list,
+    /// mirroring `reviewer_tool_list_excludes_every_mutating_tool`: it must
+    /// never be offered `write_file` (only `edit_file`, on files it's
+    /// further scoped to outside this list) or any shell/completion tool.
+    #[test]
+    fn conflict_resolver_tool_list_excludes_write_file_and_every_shell_and_completion_tool() {
+        let tools = conflict_resolver_tool_definitions();
+        let names: std::collections::HashSet<&str> = tools.iter().map(|d| d.name.as_str()).collect();
+
+        for excluded in ["write_file", "run_command", "run_tests", "run_linter", "run_build", "report_completion", "send_message"] {
+            assert!(!names.contains(excluded), "conflict resolver tool list must not include '{excluded}'");
+        }
+        assert!(names.contains("read_file"));
+        assert!(names.contains("edit_file"));
+        assert!(names.contains("git_status"));
+        assert!(names.contains("git_diff"));
+        assert_eq!(names.len(), 4);
     }
 }
