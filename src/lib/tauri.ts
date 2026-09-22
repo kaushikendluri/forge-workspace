@@ -21,6 +21,8 @@ import type {
   FilePreviewDto,
   GitFileDiff,
   GitStatus,
+  MergeReadinessDto,
+  MergeResultDto,
   Mission,
   ModelConfig,
   Notification,
@@ -96,6 +98,10 @@ export interface CommandMap {
   list_test_runs: { args: { projectId: string; kind: TestRunKind | null }; result: TestRun[] };
   request_review: { args: { agentRunId: string }; result: ReviewDto };
   get_review: { args: { agentRunId: string }; result: ReviewDto | null };
+  get_merge_readiness: { args: { agentRunId: string }; result: MergeReadinessDto };
+  merge_agent_run: { args: { agentRunId: string }; result: MergeResultDto };
+  abort_agent_run_merge: { args: { agentRunId: string }; result: void };
+  resolve_agent_run_merge_conflicts_with_agent: { args: { agentRunId: string }; result: void };
 }
 
 /**
@@ -409,4 +415,39 @@ export async function requestReview(agentRunId: string): Promise<ReviewDto> {
  */
 export async function getReview(agentRunId: string): Promise<ReviewDto | null> {
   return invokeCommand("get_review", { agentRunId });
+}
+
+/**
+ * M15: a real merge-readiness checklist for `agentRunId`'s task — tests/
+ * build/review status plus a live dry-run conflict check against the
+ * repository's primary checkout.
+ */
+export async function getMergeReadiness(agentRunId: string): Promise<MergeReadinessDto> {
+  return invokeCommand("get_merge_readiness", { agentRunId });
+}
+
+/**
+ * M15: performs a real merge of `agentRunId`'s worktree branch into its base
+ * branch, in the repository's primary checkout. Never auto-resolves a
+ * conflict — on a conflict, the primary checkout is left genuinely mid-merge
+ * and this resolves with `merged: false` and the conflicted files.
+ */
+export async function mergeAgentRun(agentRunId: string): Promise<MergeResultDto> {
+  return invokeCommand("merge_agent_run", { agentRunId });
+}
+
+/** M15: `git merge --abort` in the primary checkout — the honest "back out" path for a conflicted merge. */
+export async function abortAgentRunMerge(agentRunId: string): Promise<void> {
+  return invokeCommand("abort_agent_run_merge", { agentRunId });
+}
+
+/**
+ * M15: runs the bounded, scoped AI conflict resolver against `agentRunId`'s
+ * currently-conflicted primary-checkout merge. An explicit, user-requested
+ * action — never triggered automatically. Rejects with a clear message if no
+ * Anthropic API key is configured, or if it can't fully resolve every
+ * conflict (the merge is left conflicted either way, never a bad commit).
+ */
+export async function resolveAgentRunMergeConflictsWithAgent(agentRunId: string): Promise<void> {
+  return invokeCommand("resolve_agent_run_merge_conflicts_with_agent", { agentRunId });
 }

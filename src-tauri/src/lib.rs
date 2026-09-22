@@ -120,6 +120,10 @@ pub fn run() {
             commands::testing_commands::list_test_runs,
             commands::review_commands::request_review,
             commands::review_commands::get_review,
+            commands::merge_commands::get_merge_readiness,
+            commands::merge_commands::merge_agent_run,
+            commands::merge_commands::abort_agent_run_merge,
+            commands::merge_commands::resolve_agent_run_merge_conflicts_with_agent,
         ])
         .run(tauri::generate_context!())
         .expect("error while running forge-workspace");

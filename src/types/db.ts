@@ -464,3 +464,46 @@ export interface ProjectCommandSettingsDto {
   lintCommand: CommandSettingDto;
   buildCommand: CommandSettingDto;
 }
+
+/**
+ * M15: one merge-readiness signal's tri-state — `"not_run"` is distinct from
+ * `"failed"` (a task with no review/test run yet isn't a failure, it just
+ * hasn't happened). Mirrors `src-tauri/src/commands/merge_commands.rs`'s
+ * `ReadinessCheck`.
+ */
+export type ReadinessCheck = "not_run" | "passed" | "failed";
+
+/**
+ * M15: one conflicted file from a real (or dry-run) merge attempt, with
+ * git's own raw two-character unmerged status code (`UU`, `AA`, `UD`, ...).
+ * Mirrors `src-tauri/src/git/mod.rs`'s `ConflictedFile`.
+ */
+export interface ConflictedFile {
+  path: string;
+  statusCode: string;
+}
+
+/**
+ * M15: a real merge-readiness checklist for one agent run's task — every
+ * field computed from real state, never fabricated. `noConflicts` is a live
+ * dry-run merge check, always `"passed"`/`"failed"`, never `"not_run"`.
+ * Mirrors `src-tauri/src/commands/merge_commands.rs`'s `MergeReadinessDto`.
+ */
+export interface MergeReadinessDto {
+  tests: ReadinessCheck;
+  build: ReadinessCheck;
+  review: ReadinessCheck;
+  noConflicts: ReadinessCheck;
+  conflictedFiles: ConflictedFile[];
+  canMerge: boolean;
+}
+
+/**
+ * M15: the result of a real merge attempt (`mergeAgentRun`). `conflicts` is
+ * non-empty exactly when `merged` is `false`. Mirrors
+ * `src-tauri/src/commands/merge_commands.rs`'s `MergeResultDto`.
+ */
+export interface MergeResultDto {
+  merged: boolean;
+  conflicts: ConflictedFile[];
+}

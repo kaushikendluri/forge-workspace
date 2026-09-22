@@ -709,6 +709,24 @@ mod tests {
         fn log(&self, _repo_root: &Path, _limit: u32) -> crate::error::AppResult<Vec<CommitInfo>> {
             Ok(vec![])
         }
+        fn conflicted_files(&self, _repo_root: &Path) -> crate::error::AppResult<Vec<crate::git::ConflictedFile>> {
+            Ok(vec![])
+        }
+        fn merge_branch(&self, _repo_root: &Path, _branch: &str, _into: &str) -> crate::error::AppResult<crate::git::MergeOutcome> {
+            Ok(crate::git::MergeOutcome::Clean)
+        }
+        fn merge_conflict_dry_run(&self, _repo_root: &Path, _branch: &str, _into: &str) -> crate::error::AppResult<crate::git::MergeOutcome> {
+            Ok(crate::git::MergeOutcome::Clean)
+        }
+        fn abort_merge(&self, _repo_root: &Path) -> crate::error::AppResult<()> {
+            Ok(())
+        }
+        fn stage_paths(&self, _repo_root: &Path, _paths: &[String]) -> crate::error::AppResult<()> {
+            Ok(())
+        }
+        fn commit(&self, _repo_root: &Path, _message: &str) -> crate::error::AppResult<()> {
+            Ok(())
+        }
     }
 
     struct FakeOsAdapter;
