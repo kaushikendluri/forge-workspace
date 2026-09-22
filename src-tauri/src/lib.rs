@@ -118,6 +118,8 @@ pub fn run() {
             commands::testing_commands::set_project_command_setting,
             commands::testing_commands::run_test_suite,
             commands::testing_commands::list_test_runs,
+            commands::review_commands::request_review,
+            commands::review_commands::get_review,
         ])
         .run(tauri::generate_context!())
         .expect("error while running forge-workspace");

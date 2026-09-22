@@ -16,7 +16,7 @@
 //! tasks concurrently internally, but starting/stopping *the mission* is
 //! still exactly one `CancellationToken` registered/cancelled, same as M9.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use rusqlite::Connection;
@@ -25,10 +25,10 @@ use tauri::{AppHandle, Manager};
 use tokio_util::sync::CancellationToken;
 
 use crate::commands::run_blocking;
-use crate::db::models::{AgentMessage, Mission, MissionStatus, Task, TaskPriority};
+use crate::db::models::{AgentMessage, Mission, MissionStatus, ReviewStatus, Task, TaskPriority};
 use crate::db::repository::{
     agent_messages as agent_messages_repo, missions as missions_repo, model_configs as model_configs_repo,
-    repositories as repositories_repo, tasks as tasks_repo,
+    repositories as repositories_repo, reviews as reviews_repo, tasks as tasks_repo,
 };
 use crate::error::{AppError, AppResult};
 use crate::git::{GitCliService, GitService};
@@ -263,6 +263,15 @@ pub struct TaskBoardEntryDto {
     #[serde(flatten)]
     pub task: Task,
     pub column: BoardColumn,
+    /// M14: the latest review's score for this task's agent run, if any has
+    /// ever completed (`pending`, `passed`, or `failed`) — `None` when no
+    /// review was ever requested for it. Derived from the same
+    /// `reviews_repo::latest_reviews_for_runs` batch lookup that decides
+    /// `column`, not a separate query.
+    pub review_score: Option<i64>,
+    /// M14: the latest review's status for this task's agent run, mirroring
+    /// `review_score` above.
+    pub review_status: Option<ReviewStatus>,
 }
 
 /// M11: `mission_id`'s tasks (plan order), each labeled with its derived
@@ -271,19 +280,37 @@ pub struct TaskBoardEntryDto {
 /// already returns: nothing here writes anything, and `column` can never
 /// disagree with what the scheduler would actually do next, since it's
 /// computed with the scheduler's own `classify_task` (see
-/// `orchestrator::scheduler::board_column_for_task`'s docs).
+/// `orchestrator::scheduler::board_column_for_task`'s docs). M14: also folds
+/// in each task's latest review (`reviews_repo::latest_reviews_for_runs`,
+/// one batched query) — a `done` task with a currently-`pending` review
+/// renders as the `Review` column instead of jumping straight to `Complete`,
+/// and every task carries its latest review's score/status (if any) for a
+/// board-level badge.
 #[tauri::command]
 pub async fn list_mission_board(app: AppHandle, mission_id: String) -> Result<Vec<TaskBoardEntryDto>, String> {
     run_blocking(move || -> AppResult<Vec<TaskBoardEntryDto>> {
         let state = app.state::<AppState>();
         let conn = state.db.get()?;
         let tasks = tasks_repo::list_for_mission(&conn, &mission_id)?;
-        let columns = scheduler::compute_board_columns(&tasks);
+        let run_ids: Vec<String> = tasks.iter().filter_map(|t| t.agent_run_id.clone()).collect();
+        let latest_reviews = reviews_repo::latest_reviews_for_runs(&conn, &run_ids)?;
+        let pending_review_run_ids: HashSet<String> = latest_reviews
+            .iter()
+            .filter(|(_, review)| review.status == ReviewStatus::Pending)
+            .map(|(run_id, _)| run_id.clone())
+            .collect();
+        let columns = scheduler::compute_board_columns(&tasks, &pending_review_run_ids);
         Ok(tasks
             .into_iter()
             .map(|t| {
                 let column = columns.get(&t.id).copied().unwrap_or(BoardColumn::Backlog);
-                TaskBoardEntryDto { task: t, column }
+                let review = t.agent_run_id.as_deref().and_then(|id| latest_reviews.get(id));
+                TaskBoardEntryDto {
+                    review_score: review.map(|r| r.score),
+                    review_status: review.map(|r| r.status),
+                    task: t,
+                    column,
+                }
             })
             .collect())
     })

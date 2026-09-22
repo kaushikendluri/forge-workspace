@@ -28,6 +28,7 @@ import type {
   ProjectCommandSettingsDto,
   ProjectDto,
   Repository,
+  ReviewDto,
   Task,
   TaskBoardEntryDto,
   TestRun,
@@ -93,6 +94,8 @@ export interface CommandMap {
   set_project_command_setting: { args: { projectId: string; kind: TestRunKind; value: string }; result: void };
   run_test_suite: { args: { projectId: string; kind: TestRunKind }; result: TestRun };
   list_test_runs: { args: { projectId: string; kind: TestRunKind | null }; result: TestRun[] };
+  request_review: { args: { agentRunId: string }; result: ReviewDto };
+  get_review: { args: { agentRunId: string }; result: ReviewDto | null };
 }
 
 /**
@@ -387,4 +390,23 @@ export async function runTestSuite(projectId: string, kind: TestRunKind): Promis
 /** `projectId`'s test/lint/build run history, most recent first, optionally narrowed to one `kind`. */
 export async function listTestRuns(projectId: string, kind: TestRunKind | null = null): Promise<TestRun[]> {
   return invokeCommand("list_test_runs", { projectId, kind });
+}
+
+/**
+ * M14: runs a real reviewer pass for `agentRunId` (which must already be
+ * `completed`) end to end and returns the persisted review. Rejects with a
+ * clear message if no Anthropic API key is configured — never fabricates a
+ * score.
+ */
+export async function requestReview(agentRunId: string): Promise<ReviewDto> {
+  return invokeCommand("request_review", { agentRunId });
+}
+
+/**
+ * M14: the latest review for `agentRunId`, if any has ever completed —
+ * `null` both when a review was never requested and when the most recent
+ * attempt errored out before completing.
+ */
+export async function getReview(agentRunId: string): Promise<ReviewDto | null> {
+  return invokeCommand("get_review", { agentRunId });
 }

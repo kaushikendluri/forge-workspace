@@ -25,6 +25,12 @@ pub const MISSION_STATUS_CHANGED: &str = "mission:status-changed";
 /// finished, blocked, cancelled), emitted alongside the real `tasks` row
 /// write so `Tasks.tsx` can reflect it live without polling.
 pub const MISSION_TASK_UPDATED: &str = "mission:task-updated";
+/// M14: a review for an agent run was created or completed — emitted by
+/// `agent::reviewer::run_review` so `AgentDetail.tsx`'s review panel and
+/// `Tasks.tsx`'s board (Review column / score badge) can update live rather
+/// than only on next poll, whether the review was requested manually or
+/// auto-triggered by the scheduler once a mission task completes.
+pub const REVIEW_UPDATED: &str = "review:updated";
 pub const TERMINAL_OUTPUT: &str = "terminal:output";
 pub const TERMINAL_EXIT: &str = "terminal:exit";
 

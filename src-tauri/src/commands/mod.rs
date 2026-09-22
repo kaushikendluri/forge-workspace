@@ -9,6 +9,7 @@ pub mod git_commands;
 pub mod mission_commands;
 pub mod notifications_commands;
 pub mod project_commands;
+pub mod review_commands;
 pub mod settings_commands;
 pub mod terminal_commands;
 pub mod testing_commands;
