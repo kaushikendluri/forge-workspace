@@ -114,6 +114,7 @@ export function Sidebar() {
         { label: "Changes", to: `/projects/${activeProjectId}/changes`, icon: GitCompare },
         { label: "Terminal", to: `/projects/${activeProjectId}/terminal`, icon: SquareTerminal },
         { label: "Testing", to: `/projects/${activeProjectId}/testing`, icon: FlaskConical },
+        { label: "Project Brain", to: `/projects/${activeProjectId}/brain`, icon: BrainCircuit },
       ]
     : [];
 
@@ -124,6 +125,7 @@ export function Sidebar() {
         { label: "Changes", icon: GitCompare, reason: "Open a project to enable" },
         { label: "Terminal", icon: SquareTerminal, reason: "Open a project to enable" },
         { label: "Testing", icon: FlaskConical, reason: "Open a project to enable" },
+        { label: "Project Brain", icon: BrainCircuit, reason: "Open a project to enable" },
       ];
 
   return (
@@ -170,10 +172,6 @@ export function Sidebar() {
         {projectItemsDisabled.map((item) => (
           <SidebarDisabledItem key={item.label} item={item} collapsed={collapsed} />
         ))}
-        <SidebarDisabledItem
-          item={{ label: "Project Brain", icon: BrainCircuit, reason: "Coming in a later phase" }}
-          collapsed={collapsed}
-        />
 
         <div className="my-2 h-px bg-border" />
 

@@ -27,6 +27,7 @@ import type {
   ModelConfig,
   Notification,
   Project,
+  ProjectBrainDto,
   ProjectCommandSettingsDto,
   ProjectDto,
   Repository,
@@ -108,6 +109,8 @@ export interface CommandMap {
   accept_visual_snapshot: { args: { snapshotId: string }; result: void };
   flag_visual_snapshot: { args: { snapshotId: string }; result: void };
   create_visual_regression_follow_up_task: { args: { snapshotId: string }; result: Task };
+  get_project_brain: { args: { projectId: string }; result: ProjectBrainDto | null };
+  regenerate_project_brain: { args: { projectId: string }; result: ProjectBrainDto };
 }
 
 /**
@@ -489,4 +492,25 @@ export async function flagVisualSnapshot(snapshotId: string): Promise<void> {
  */
 export async function createVisualRegressionFollowUpTask(snapshotId: string): Promise<Task> {
   return invokeCommand("create_visual_regression_follow_up_task", { snapshotId });
+}
+
+/**
+ * Phase 5 M17: `projectId`'s Project Brain, if one has ever been generated
+ * — `null` is the honest "not yet analyzed" state, never a fabricated
+ * placeholder. A background auto-regeneration check already ran when the
+ * project was opened (`open_project`/`init_project`); this just reads
+ * whatever that (or an earlier explicit refresh) produced.
+ */
+export async function getProjectBrain(projectId: string): Promise<ProjectBrainDto | null> {
+  return invokeCommand("get_project_brain", { projectId });
+}
+
+/**
+ * Phase 5 M17: explicit, user-requested "Regenerate" — always runs a real
+ * analysis end to end regardless of the background auto-refresh policy, and
+ * rejects with a clear message if no Anthropic API key is configured —
+ * never fabricates a stack/architecture/conventions summary.
+ */
+export async function regenerateProjectBrain(projectId: string): Promise<ProjectBrainDto> {
+  return invokeCommand("regenerate_project_brain", { projectId });
 }

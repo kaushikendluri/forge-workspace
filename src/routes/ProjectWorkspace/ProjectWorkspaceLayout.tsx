@@ -9,6 +9,7 @@ const tabs = [
   { label: "Changes", to: "changes" },
   { label: "Terminal", to: "terminal" },
   { label: "Testing", to: "testing" },
+  { label: "Project Brain", to: "brain" },
 ];
 
 /**
