@@ -3,6 +3,7 @@
 //!
 //! Module map:
 //! - `agent`    — the Anthropic tool-calling run loop (M6)
+//! - `brain`    — Phase 5 M17: the Project Brain (repo-context gathering + one structured analysis call, cached until the repo meaningfully changes)
 //! - `browser`  — M16: real browser automation (`chromiumoxide`) behind a testable trait, for the agent's browser_* tools
 //! - `commands` — `#[tauri::command]` functions exposed to the frontend
 //! - `db`       — SQLite pool, migrations, row models, per-table repositories
@@ -18,6 +19,7 @@
 //! - `error`    — the app-wide `AppError`/`AppResult` types
 
 pub mod agent;
+pub mod brain;
 pub mod browser;
 pub mod commands;
 pub mod db;
@@ -154,6 +156,8 @@ pub fn run() {
             commands::visual_commands::accept_visual_snapshot,
             commands::visual_commands::flag_visual_snapshot,
             commands::visual_commands::create_visual_regression_follow_up_task,
+            commands::brain_commands::get_project_brain,
+            commands::brain_commands::regenerate_project_brain,
         ])
         .run(tauri::generate_context!())
         .expect("error while running forge-workspace");

@@ -139,34 +139,48 @@ fn open_or_register(state: &AppState, path: &str, explicit_name: Option<&str>) -
 
 /// Registers (or re-opens) the git repository at `path` as a project.
 /// Errors if `path` doesn't exist or isn't a git repository — never
-/// fabricates a project for a folder that isn't actually one.
+/// fabricates a project for a folder that isn't actually one. Once
+/// registered, Phase 5 M17's Project Brain auto-regeneration check runs in
+/// the background (`brain::maybe_auto_regenerate`) — fire-and-forget, never
+/// delaying this command's own response.
 #[tauri::command]
 pub async fn open_project(app: AppHandle, path: String) -> Result<ProjectDto, String> {
-    run_blocking(move || {
-        let state = app.state::<AppState>();
-        open_or_register(&state, &path, None)
+    let dto = run_blocking({
+        let app = app.clone();
+        move || {
+            let state = app.state::<AppState>();
+            open_or_register(&state, &path, None)
+        }
     })
-    .await
+    .await?;
+    crate::brain::maybe_auto_regenerate(&app, &dto.id);
+    Ok(dto)
 }
 
 /// Creates `path` (if missing), `git init`s it if it isn't already a
-/// repository, then registers it as a project named `name`.
+/// repository, then registers it as a project named `name`. Same background
+/// Project Brain check as `open_project` once registered.
 #[tauri::command]
 pub async fn init_project(app: AppHandle, path: String, name: String) -> Result<ProjectDto, String> {
-    run_blocking(move || {
-        let state = app.state::<AppState>();
-        let root = PathBuf::from(&path);
-        std::fs::create_dir_all(&root)?;
+    let dto = run_blocking({
+        let app = app.clone();
+        move || {
+            let state = app.state::<AppState>();
+            let root = PathBuf::from(&path);
+            std::fs::create_dir_all(&root)?;
 
-        if !state.git_service.is_git_repository(&root) {
-            state.git_service.init(&root)?;
+            if !state.git_service.is_git_repository(&root) {
+                state.git_service.init(&root)?;
+            }
+
+            let name = name.trim();
+            let name = if name.is_empty() { None } else { Some(name) };
+            open_or_register(&state, &path, name)
         }
-
-        let name = name.trim();
-        let name = if name.is_empty() { None } else { Some(name) };
-        open_or_register(&state, &path, name)
     })
-    .await
+    .await?;
+    crate::brain::maybe_auto_regenerate(&app, &dto.id);
+    Ok(dto)
 }
 
 /// All known projects, most recently updated first.

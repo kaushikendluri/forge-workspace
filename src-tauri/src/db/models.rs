@@ -485,3 +485,28 @@ pub struct Notification {
     pub is_read: bool,
     pub created_at: String,
 }
+
+/// Phase 5 M17: one project's persisted Project Brain — see
+/// `migrations/0010_project_brain.sql`'s own docs for the table's shape and
+/// why there's exactly one row per project. The five `*_json` fields are the
+/// raw structured-output JSON `brain::analyze_project`'s forced tool call
+/// produced (a serialized `Vec<String>`, a plain string, or a serialized
+/// `Vec<brain::BrainImportantFile>` — kept as raw text at this layer the same
+/// way `reviews.findings_json` is, parsed back into real typed values only at
+/// `commands::brain_commands::ProjectBrainDto`). `source_commit_sha` is the
+/// repository's `HEAD` commit at generation time, empty string if the
+/// repository had no commits yet — `brain::should_regenerate` compares
+/// against it to decide whether this row is still fresh enough to serve.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectBrain {
+    pub id: String,
+    pub project_id: String,
+    pub stack_json: String,
+    pub architecture_json: String,
+    pub conventions_json: String,
+    pub testing_json: String,
+    pub important_files_json: String,
+    pub generated_at: String,
+    pub source_commit_sha: String,
+}

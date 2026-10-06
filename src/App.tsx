@@ -10,6 +10,7 @@ import { FilesTab } from "@/routes/ProjectWorkspace/FilesTab";
 import { ChangesTab } from "@/routes/ProjectWorkspace/ChangesTab";
 import { TerminalTab } from "@/routes/ProjectWorkspace/TerminalTab";
 import { TestingTab } from "@/routes/ProjectWorkspace/TestingTab";
+import { ProjectBrainTab } from "@/routes/ProjectWorkspace/ProjectBrainTab";
 import { AgentDetail } from "@/routes/AgentDetail/AgentDetail";
 import { Settings } from "@/routes/Settings/Settings";
 
@@ -38,6 +39,11 @@ function TestingTabRoute() {
   return <TestingTab projectId={projectId ?? ""} />;
 }
 
+function ProjectBrainTabRoute() {
+  const { projectId } = useParams<{ projectId: string }>();
+  return <ProjectBrainTab projectId={projectId ?? ""} />;
+}
+
 export function App() {
   return (
     <Routes>
@@ -54,6 +60,7 @@ export function App() {
           <Route path="changes" element={<ChangesTabRoute />} />
           <Route path="terminal" element={<TerminalTabRoute />} />
           <Route path="testing" element={<TestingTabRoute />} />
+          <Route path="brain" element={<ProjectBrainTabRoute />} />
           <Route path="agents/:agentId" element={<AgentDetail />} />
         </Route>
 

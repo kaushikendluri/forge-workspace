@@ -153,6 +153,55 @@ pub fn detect_commands(root: &Path) -> DetectedCommands {
         .unwrap_or_default()
 }
 
+/// The same marker files [`detect_node`]/[`detect_rust`]/[`detect_go`]/
+/// [`detect_python`] each check for, reused by Phase 5 M17's Project Brain
+/// (`brain::gather_repo_context`) for its repo-context signal — unlike
+/// [`detect_commands`], which picks exactly *one* ecosystem's commands, the
+/// Brain wants to know about every marker file present (a repo can
+/// genuinely be more than one ecosystem, e.g. this one, whose Tauri backend
+/// lives in `src-tauri/`).
+pub const STACK_MARKER_FILES: &[&str] = &["package.json", "Cargo.toml", "go.mod", "pyproject.toml", "requirements.txt"];
+
+/// Config files checked for exact-name presence — see [`scan_present_convention_files`].
+const CONVENTION_FILE_EXACT: &[&str] = &["tsconfig.json", ".editorconfig", "rustfmt.toml", ".rustfmt.toml", "ruff.toml", ".flake8"];
+
+/// Config file name *prefixes* checked for — several valid extensions exist
+/// for each (`.eslintrc.json`/`.eslintrc.js`/..., `prettier.config.js`/
+/// `prettier.config.cjs`/...) — see [`scan_present_convention_files`].
+const CONVENTION_FILE_PREFIXES: &[&str] = &[".eslintrc", "prettier.config", ".prettierrc"];
+
+/// Which of [`STACK_MARKER_FILES`] exist directly in `root` — no recursion,
+/// same non-recursive scope as [`detect_commands`]. Used only to *report*
+/// real signals (e.g. to the Project Brain's analysis prompt), never to pick
+/// or run anything, so unlike `detect_commands` there's no ecosystem
+/// precedence here — every marker file actually present is reported.
+pub fn scan_present_marker_files(root: &Path) -> Vec<String> {
+    STACK_MARKER_FILES.iter().filter(|name| root.join(name).is_file()).map(|s| s.to_string()).collect()
+}
+
+/// Which convention/config files exist directly in `root` ([`CONVENTION_FILE_EXACT`]
+/// by exact name, [`CONVENTION_FILE_PREFIXES`] by prefix) — a real, honest
+/// signal that e.g. ESLint/Prettier/strict TypeScript/rustfmt is configured
+/// at all, never a guess at what the config actually says. Sorted for
+/// deterministic output (prompt-building and tests both want stable order).
+pub fn scan_present_convention_files(root: &Path) -> Vec<String> {
+    let Ok(read_dir) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut found: Vec<String> = read_dir
+        .flatten()
+        .filter(|entry| entry.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let matches = CONVENTION_FILE_EXACT.contains(&name.as_str())
+                || CONVENTION_FILE_PREFIXES.iter().any(|prefix| name.starts_with(prefix));
+            matches.then_some(name)
+        })
+        .collect();
+    found.sort();
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,6 +323,39 @@ mod tests {
         write(dir.path(), "pyproject.toml", "[project]\nname = \"x\"\n");
         let detected = detect_commands(dir.path());
         assert_eq!(detected.test_command.as_deref(), Some("cargo test"));
+    }
+
+    #[test]
+    fn scan_present_marker_files_reports_every_ecosystem_marker_found() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "package.json", "{}");
+        write(dir.path(), "Cargo.toml", "[package]\nname = \"x\"\n");
+        let found = scan_present_marker_files(dir.path());
+        assert_eq!(found, vec!["Cargo.toml".to_string(), "package.json".to_string()], "both markers present should both be reported, unlike detect_commands' single-ecosystem precedence");
+    }
+
+    #[test]
+    fn scan_present_marker_files_is_empty_for_an_unrecognized_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(scan_present_marker_files(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn scan_present_convention_files_finds_exact_and_prefixed_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "tsconfig.json", "{}");
+        write(dir.path(), ".eslintrc.json", "{}");
+        write(dir.path(), "prettier.config.js", "module.exports = {}");
+        write(dir.path(), "not-a-convention-file.txt", "");
+        let found = scan_present_convention_files(dir.path());
+        assert_eq!(found, vec![".eslintrc.json".to_string(), "prettier.config.js".to_string(), "tsconfig.json".to_string()]);
+    }
+
+    #[test]
+    fn scan_present_convention_files_is_empty_when_none_present() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "README.md", "hello");
+        assert!(scan_present_convention_files(dir.path()).is_empty());
     }
 
     #[test]

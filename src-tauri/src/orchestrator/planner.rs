@@ -144,7 +144,7 @@ fn build_repo_context(repo_root: &Path, git: &dyn GitService) -> String {
 /// suffixed `/`) — the same shallow granularity as the Files tab's directory
 /// listing (`commands::fs_commands::list_directory`), capped rather than a
 /// full recursive repository walk.
-fn shallow_top_level_listing(repo_root: &Path) -> String {
+pub(crate) fn shallow_top_level_listing(repo_root: &Path) -> String {
     let Ok(read_dir) = std::fs::read_dir(repo_root) else {
         return "(unable to list repository contents)".to_string();
     };

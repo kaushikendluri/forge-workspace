@@ -9,6 +9,7 @@ pub mod agents;
 pub mod missions;
 pub mod model_configs;
 pub mod notifications;
+pub mod project_brain;
 pub mod projects;
 pub mod repositories;
 pub mod reviews;
