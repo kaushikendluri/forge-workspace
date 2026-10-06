@@ -331,7 +331,7 @@ mod tests {
         write(dir.path(), "package.json", "{}");
         write(dir.path(), "Cargo.toml", "[package]\nname = \"x\"\n");
         let found = scan_present_marker_files(dir.path());
-        assert_eq!(found, vec!["Cargo.toml".to_string(), "package.json".to_string()], "both markers present should both be reported, unlike detect_commands' single-ecosystem precedence");
+        assert_eq!(found, vec!["package.json".to_string(), "Cargo.toml".to_string()], "both markers present should both be reported, in STACK_MARKER_FILES's declared order, unlike detect_commands' single-ecosystem precedence");
     }
 
     #[test]
