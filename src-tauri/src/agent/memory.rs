@@ -164,7 +164,14 @@ pub fn extract_memories_from_run(
 ) -> Vec<ExtractedMemory> {
     let mut memories = Vec::new();
 
-    let non_empty = |s: Option<&str>| s.map(str::trim).filter(move |s| !s.is_empty());
+    // A plain fn, not a `let`-bound closure: this is called below with two
+    // `&str` arguments of genuinely different lifetimes (`outcome_detail`
+    // and `error_message`), and a closure's input lifetime is inferred as
+    // one concrete lifetime from its first call site rather than being
+    // generic over `'a` the way a fn item's elided lifetime is.
+    fn non_empty(s: Option<&str>) -> Option<&str> {
+        s.map(str::trim).filter(|s| !s.is_empty())
+    }
 
     match status {
         AgentRunStatus::Completed => {
