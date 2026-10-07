@@ -281,7 +281,7 @@ struct GeminiStreamAccumulator {
 }
 
 impl GeminiStreamAccumulator {
-    fn apply(&mut self, raw: &str, on_text_delta: &mut dyn FnMut(&str)) -> AppResult<()> {
+    fn apply(&mut self, raw: &str, on_text_delta: &mut dyn for<'a> FnMut(&'a str)) -> AppResult<()> {
         let chunk: GenerateContentResponse =
             serde_json::from_str(raw).map_err(|e| AppError::Other(format!("failed to parse Gemini stream chunk: {e} (raw: {raw})")))?;
 
@@ -393,7 +393,7 @@ impl ModelProvider for GoogleProvider {
         messages: &[MessageParam],
         tools: &[ToolDefinition],
         cancel: &CancellationToken,
-        on_text_delta: &mut (dyn FnMut(&str) + Send),
+        on_text_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
     ) -> AppResult<StreamOutcome> {
         let url = format!("{API_BASE}/{model}:streamGenerateContent?alt=sse&key={}", self.api_key);
         let body = build_request_body(system, messages, tools, max_tokens, None);

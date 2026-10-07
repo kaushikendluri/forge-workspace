@@ -55,7 +55,7 @@ impl ModelProvider for OpenRouterProvider {
         messages: &[MessageParam],
         tools: &[ToolDefinition],
         cancel: &CancellationToken,
-        on_text_delta: &mut (dyn FnMut(&str) + Send),
+        on_text_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
     ) -> AppResult<StreamOutcome> {
         stream_turn_impl(&self.http, API_URL, &self.api_key, model, max_tokens, system, messages, tools, cancel, on_text_delta).await
     }

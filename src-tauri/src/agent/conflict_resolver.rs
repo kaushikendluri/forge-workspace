@@ -60,7 +60,7 @@ use crate::secrets;
 use crate::state::AppState;
 
 use super::anthropic_client::{ContentBlockParam, MessageParam, StreamOutcome};
-use super::provider::{self, ModelProvider};
+use super::provider;
 use super::schema::conflict_resolver_tool_definitions;
 use super::tool_loop::to_content_block_param;
 use super::tools::{dispatch_tool, MissionContext as ToolMissionContext, ToolContext, ToolRunOutcome};

@@ -6,12 +6,15 @@
 //! straight through to that module's own, already-correct inherent methods.
 //!
 //! The only translation happening here is on `on_text_delta`: the trait
-//! takes `&mut dyn FnMut(&str)` (so it's `dyn`-callable); `AnthropicClient`'s
+//! takes `&mut (dyn for<'a> FnMut(&'a str) + Send)` (so it's `dyn`-callable,
+//! and explicitly higher-ranked — see `ModelProvider::stream_turn`'s own
+//! docs for why that can't just be elided here); `AnthropicClient`'s
 //! inherent `stream_turn` takes `impl FnMut(&str)`. No conversion code is
 //! actually needed for that, though — the standard library's blanket
-//! `impl<F: FnMut<A>> FnMut<A> for &mut F` means a `&mut dyn FnMut(&str)`
-//! already *is* an `FnMut(&str)`, so it satisfies the inherent method's
-//! `impl FnMut(&str)` bound exactly as handed in.
+//! `impl<F: ?Sized + FnMut<A>> FnMut<A> for &mut F` means a
+//! `&mut dyn for<'a> FnMut(&'a str)` already *is* an `FnMut(&str)`, so it
+//! satisfies the inherent method's `impl FnMut(&str)` bound exactly as
+//! handed in.
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
@@ -43,7 +46,7 @@ impl ModelProvider for AnthropicProvider {
         messages: &[MessageParam],
         tools: &[ToolDefinition],
         cancel: &CancellationToken,
-        on_text_delta: &mut (dyn FnMut(&str) + Send),
+        on_text_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
     ) -> AppResult<StreamOutcome> {
         self.inner.stream_turn(model, max_tokens, system, messages, tools, cancel, on_text_delta).await
     }

@@ -289,7 +289,7 @@ struct OpenAiStreamAccumulator {
 }
 
 impl OpenAiStreamAccumulator {
-    fn apply(&mut self, raw: &str, on_text_delta: &mut dyn FnMut(&str)) -> AppResult<()> {
+    fn apply(&mut self, raw: &str, on_text_delta: &mut dyn for<'a> FnMut(&'a str)) -> AppResult<()> {
         let chunk: ChatCompletionChunk =
             serde_json::from_str(raw).map_err(|e| AppError::Other(format!("failed to parse OpenAI stream chunk: {e} (raw: {raw})")))?;
 
@@ -379,7 +379,7 @@ pub(super) async fn stream_turn_impl(
     messages: &[MessageParam],
     tools: &[ToolDefinition],
     cancel: &CancellationToken,
-    on_text_delta: &mut (dyn FnMut(&str) + Send),
+    on_text_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
 ) -> AppResult<StreamOutcome> {
     let mut body = json!({
         "model": model,
@@ -477,7 +477,7 @@ impl ModelProvider for OpenAIProvider {
         messages: &[MessageParam],
         tools: &[ToolDefinition],
         cancel: &CancellationToken,
-        on_text_delta: &mut (dyn FnMut(&str) + Send),
+        on_text_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
     ) -> AppResult<StreamOutcome> {
         stream_turn_impl(&self.http, API_URL, &self.api_key, model, max_tokens, system, messages, tools, cancel, on_text_delta).await
     }

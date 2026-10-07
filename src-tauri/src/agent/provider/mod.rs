@@ -54,7 +54,15 @@ pub trait ModelProvider: Send + Sync {
     /// relies on. `on_text_delta` is `&mut dyn FnMut` (not `impl FnMut`,
     /// which `AnthropicClient`'s own inherent method still uses) purely
     /// because a trait method can't be generic and still be `dyn`-callable
-    /// — callers pass `&mut closure` instead of the closure itself.
+    /// — callers pass `&mut closure` instead of the closure itself. The
+    /// `for<'a>` is written explicitly (rather than relying on the usual
+    /// elision to higher-rank it) because `#[async_trait]`'s signature
+    /// rewriting otherwise collapses the elided lifetime to one concrete
+    /// lifetime tied to the call, which then fails to unify with the plain
+    /// (non-async, properly-elided) functions each real implementation
+    /// forwards to — every `impl ModelProvider` and every free function it
+    /// delegates to must repeat this exact `for<'a>` form, not just
+    /// `dyn FnMut(&str)`.
     async fn stream_turn(
         &self,
         model: &str,
@@ -63,7 +71,7 @@ pub trait ModelProvider: Send + Sync {
         messages: &[MessageParam],
         tools: &[ToolDefinition],
         cancel: &CancellationToken,
-        on_text_delta: &mut (dyn FnMut(&str) + Send),
+        on_text_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
     ) -> AppResult<StreamOutcome>;
 
     /// Sends one non-streaming, forced-tool-choice request, guaranteeing the
@@ -159,7 +167,13 @@ mod tests {
 
     #[test]
     fn for_name_rejects_an_unknown_provider_before_any_io() {
-        let err = for_name("made_up_provider", "key".to_string()).expect_err("should reject");
+        // Not `.expect_err(...)`: the `Ok` type here is `Box<dyn
+        // ModelProvider>`, which doesn't implement `Debug` (and shouldn't —
+        // it's a live HTTP client, not a value worth debug-printing), and
+        // `expect_err` requires `T: Debug` to format a panic message for the
+        // (unreached) `Ok` case. Matching directly avoids that bound.
+        let result = for_name("made_up_provider", "key".to_string());
+        let Err(err) = result else { panic!("should reject an unknown provider") };
         assert!(err.to_string().contains("made_up_provider"));
     }
 
