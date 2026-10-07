@@ -510,3 +510,34 @@ pub struct ProjectBrain {
     pub generated_at: String,
     pub source_commit_sha: String,
 }
+
+/// Phase 5 M18: the four kinds of memory an agent's own past runs can leave
+/// behind — see `migrations/0011_agent_memory.sql` for why each exists and
+/// `agent::memory::extract_memories_from_run` for how they're actually
+/// produced (mechanically from `tool_calls`/a run's own outcome, never a
+/// fresh AI call).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentMemoryKind {
+    Decision,
+    FileContext,
+    Error,
+    CompletedWork,
+}
+
+/// One row of an agent's persisted memory. `agent_run_id` is the run that
+/// produced it, `None` if that run was since deleted (`ON DELETE SET NULL`)
+/// — the memory itself still stands on its own. `relevance_tags` is a
+/// plain space-separated lowercase keyword string (see the migration's own
+/// docs for why), consumed by `agent::memory::rank_relevant_memories`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentMemory {
+    pub id: String,
+    pub agent_id: String,
+    pub agent_run_id: Option<String>,
+    pub kind: AgentMemoryKind,
+    pub content: String,
+    pub relevance_tags: String,
+    pub created_at: String,
+}

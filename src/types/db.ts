@@ -566,3 +566,29 @@ export interface ProjectBrainDto {
   generatedAt: IsoDateTime;
   sourceCommitSha: string;
 }
+
+/**
+ * Phase 5 M18: the four kinds of memory an agent's own past runs can leave
+ * behind. Mirrors `src-tauri/src/db/models.rs`'s `AgentMemoryKind`.
+ */
+export type AgentMemoryKind = "decision" | "file_context" | "error" | "completed_work";
+
+/**
+ * One row of an agent's persisted memory — extracted mechanically at the
+ * end of a run (a `completed_work` summary, files actually touched, or a
+ * real failure reason) and selectively retrieved (keyword-overlap ranked,
+ * capped small) into a future run's own system prompt. `relevanceTags` is
+ * a plain space-separated lowercase keyword string, not JSON — see
+ * `src-tauri/migrations/0011_agent_memory.sql`'s own docs for why.
+ * Returned by `listAgentMemory`. Mirrors
+ * `src-tauri/src/db/models.rs`'s `AgentMemory`.
+ */
+export interface AgentMemory {
+  id: string;
+  agentId: string;
+  agentRunId: string | null;
+  kind: AgentMemoryKind;
+  content: string;
+  relevanceTags: string;
+  createdAt: IsoDateTime;
+}

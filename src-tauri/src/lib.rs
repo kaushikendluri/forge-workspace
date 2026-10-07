@@ -158,6 +158,7 @@ pub fn run() {
             commands::visual_commands::create_visual_regression_follow_up_task,
             commands::brain_commands::get_project_brain,
             commands::brain_commands::regenerate_project_brain,
+            commands::memory_commands::list_agent_memory,
         ])
         .run(tauri::generate_context!())
         .expect("error while running forge-workspace");
