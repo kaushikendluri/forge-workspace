@@ -3,6 +3,7 @@ import { AppShell } from "@/components/layout/AppShell";
 import { Dashboard } from "@/routes/Dashboard/Dashboard";
 import { Projects } from "@/routes/Projects/Projects";
 import { Agents } from "@/routes/Agents/Agents";
+import { Skills } from "@/routes/Skills/Skills";
 import { Tasks } from "@/routes/Tasks/Tasks";
 import { Activity } from "@/routes/Activity/Activity";
 import { ProjectWorkspaceLayout } from "@/routes/ProjectWorkspace/ProjectWorkspaceLayout";
@@ -51,6 +52,7 @@ export function App() {
         <Route path="/" element={<Dashboard />} />
         <Route path="/projects" element={<Projects />} />
         <Route path="/agents" element={<Agents />} />
+        <Route path="/skills" element={<Skills />} />
         <Route path="/tasks" element={<Tasks />} />
         <Route path="/activity" element={<Activity />} />
 

@@ -4,6 +4,7 @@
 
 pub mod agent_commands;
 pub mod agent_run_commands;
+pub mod agent_skill_commands;
 pub mod brain_commands;
 pub mod fs_commands;
 pub mod git_commands;

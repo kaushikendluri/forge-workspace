@@ -47,6 +47,12 @@ pub struct Agent {
     pub name: String,
     pub status: AgentStatus,
     pub system_prompt: Option<String>,
+    /// Phase 5 M19: the Agent Skill this agent was created from, if any —
+    /// see `migrations/0012_agent_skills.sql`'s own docs for why this is
+    /// `ON DELETE SET NULL` rather than cascading. `None` for an agent
+    /// created without picking a skill (today's plain, unrestricted
+    /// default behavior, unchanged).
+    pub skill_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -540,4 +546,25 @@ pub struct AgentMemory {
     pub content: String,
     pub relevance_tags: String,
     pub created_at: String,
+}
+
+/// Phase 5 M19: one reusable, named specialist agent configuration — see
+/// `migrations/0012_agent_skills.sql`'s own docs for `tools_json`'s exact
+/// shape/sentinel and `preferred_model_id`'s semantics. Selecting a skill
+/// when creating an agent (`commands::agent_commands::create_agent`'s
+/// optional `skill_id`) copies `instructions` into that agent's
+/// `system_prompt` and records `skill_id` on it, so later runs can resolve
+/// this skill's `tools_json` restriction and `preferred_model_id` override
+/// for real (`agent::tool_loop`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSkill {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub instructions: String,
+    pub tools_json: String,
+    pub preferred_model_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
 }

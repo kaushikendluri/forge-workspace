@@ -23,8 +23,9 @@ use crate::db::models::{
 };
 use crate::db::repository::{
     activity_events as activity_events_repo, agent_memory as agent_memory_repo, agent_runs as agent_runs_repo,
-    agents as agents_repo, model_configs as model_configs_repo, notifications as notifications_repo,
-    settings as settings_repo, tasks as tasks_repo, tool_calls as tool_calls_repo, workspaces as workspaces_repo,
+    agent_skills as agent_skills_repo, agents as agents_repo, model_configs as model_configs_repo,
+    notifications as notifications_repo, settings as settings_repo, tasks as tasks_repo,
+    tool_calls as tool_calls_repo, workspaces as workspaces_repo,
 };
 use crate::db::DbConnection;
 use crate::error::{AppError, AppResult};
@@ -37,7 +38,7 @@ use super::anthropic_client::{AnthropicClient, AssistantContentBlock, ContentBlo
 use super::events as agent_events;
 use super::executor::{run_one_tool_call, ExecutedTool};
 use super::memory::{self as agent_memory, DEFAULT_RETRIEVAL_CAP};
-use super::schema::{all_tool_definitions, send_message_tool_definition};
+use super::schema::{all_tool_definitions, send_message_tool_definition, tool_definitions_for_names};
 use super::test_fix::{TestFixEvent, TestFixTracker};
 use super::tools::{MissionContext, ToolContext};
 
@@ -212,6 +213,16 @@ fn build_system_prompt(setup: &RunSetup, memory_context: Option<&str>) -> String
         base = setup.workspace.base_branch.as_deref().unwrap_or("(unknown)"),
         task = setup.agent_run.task_prompt,
     );
+    // Phase 5 M19: an agent created from a skill has that skill's
+    // `instructions` copied into its own `system_prompt` at creation time
+    // (`db::repository::agents::insert`) — appended here as its own
+    // clearly-labeled section, the same way `memory_context` below is, so
+    // the model sees it's role-specific guidance layered on top of the
+    // base rules above, not confused with the task itself. `None` for a
+    // plain agent created without a skill — unchanged behavior.
+    if let Some(system_prompt) = setup.agent.system_prompt.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        prompt.push_str(&format!("\nAdditional role-specific instructions for this agent:\n{system_prompt}\n"));
+    }
     if let Some(context) = memory_context {
         prompt.push('\n');
         prompt.push_str(context);
@@ -493,7 +504,25 @@ async fn run_agent_loop_inner(app: &AppHandle, agent_run_id: &str, cancel: &Canc
     let screenshots_dir = app.state::<AppState>().screenshots_dir.clone();
 
     let client = AnthropicClient::new(api_key)?;
-    let mut tool_defs = all_tool_definitions();
+    // Phase 5 M19: an agent created from a skill whose `tools_json` is an
+    // explicit (possibly empty) subset — not the `["*"]` "all tools"
+    // sentinel — gets exactly that subset offered, via the same
+    // `tool_definitions_for_names` filter M14's reviewer/M15's conflict
+    // resolver already established (see `agent::schema`'s own docs), never
+    // a separately invented restriction mechanism. No skill, or a skill
+    // whose `tools_json` is the sentinel, behaves exactly like today's
+    // unrestricted default.
+    let skill_tool_names: Option<Vec<String>> = match &setup.agent.skill_id {
+        Some(skill_id) => {
+            let conn = get_conn(app)?;
+            agent_skills_repo::get_by_id(&conn, skill_id)?.and_then(|s| agent_skills_repo::parse_tools_json(&s.tools_json).ok().flatten())
+        }
+        None => None,
+    };
+    let mut tool_defs = match &skill_tool_names {
+        Some(names) => tool_definitions_for_names(names),
+        None => all_tool_definitions(),
+    };
     if mission_context.is_some() {
         tool_defs.push(send_message_tool_definition());
     }
@@ -750,4 +779,112 @@ async fn run_agent_loop_inner(app: &AppHandle, agent_run_id: &str, cancel: &Canc
     let msg = format!("Reached the maximum of {} iterations without calling report_completion.", setup.max_iterations);
     finish_run(app, agent_run_id, AgentRunStatus::Stopped, Some(AgentRunStopReason::MaxIterations), None, Some(&msg)).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::models::{WorkspaceKind, WorkspaceStatus};
+
+    fn test_agent(system_prompt: Option<String>, skill_id: Option<String>) -> Agent {
+        Agent {
+            id: "agent-1".to_string(),
+            project_id: "p1".to_string(),
+            repository_id: "r1".to_string(),
+            name: "Test Agent".to_string(),
+            status: AgentStatus::Running,
+            system_prompt,
+            skill_id,
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    fn test_run_setup(agent: Agent) -> RunSetup {
+        RunSetup {
+            agent_run: AgentRun {
+                id: "run-1".to_string(),
+                agent_id: agent.id.clone(),
+                workspace_id: Some("ws-1".to_string()),
+                task_prompt: "Fix the bug in foo.rs".to_string(),
+                model_id: "claude-sonnet-5".to_string(),
+                status: AgentRunStatus::Running,
+                stop_reason: None,
+                error_message: None,
+                iteration_count: 0,
+                total_input_tokens: 0,
+                total_output_tokens: 0,
+                test_fix_attempts: 0,
+                started_at: None,
+                completed_at: None,
+            },
+            agent,
+            workspace: Workspace {
+                id: "ws-1".to_string(),
+                repository_id: "r1".to_string(),
+                agent_run_id: Some("run-1".to_string()),
+                kind: WorkspaceKind::Agent,
+                path: "/tmp/ws-1".to_string(),
+                branch_name: "forge/agent/test/abc123".to_string(),
+                base_branch: Some("main".to_string()),
+                base_commit_sha: None,
+                status: WorkspaceStatus::Active,
+                created_at: "2024-01-01T00:00:00Z".to_string(),
+                removed_at: None,
+            },
+            max_iterations: DEFAULT_MAX_ITERATIONS,
+            tool_timeout: Duration::from_millis(DEFAULT_TOOL_TIMEOUT_MS),
+            test_command: None,
+            lint_command: None,
+            build_command: None,
+            model_max_tokens: DEFAULT_MAX_TOKENS,
+            max_test_fix_attempts: DEFAULT_MAX_TEST_FIX_ATTEMPTS,
+        }
+    }
+
+    /// A plain agent (no skill, `system_prompt: None`) must produce exactly
+    /// today's prompt shape — no "Additional role-specific instructions"
+    /// section at all, since there's nothing to add.
+    #[test]
+    fn build_system_prompt_omits_the_skill_section_when_agent_has_no_system_prompt() {
+        let setup = test_run_setup(test_agent(None, None));
+        let prompt = build_system_prompt(&setup, None);
+        assert!(!prompt.contains("Additional role-specific instructions"));
+        assert!(prompt.contains(&setup.agent_run.task_prompt));
+    }
+
+    /// Phase 5 M19's core "skill application" property for the system
+    /// prompt: an agent created from a skill (its `instructions` already
+    /// copied into `system_prompt` by `db::repository::agents::insert`)
+    /// must have that exact text show up in the real prompt the model
+    /// receives, in its own clearly-labeled section.
+    #[test]
+    fn build_system_prompt_includes_the_agents_system_prompt_as_its_own_section() {
+        let instructions = "Prefer function components and hooks; always add tests.";
+        let setup = test_run_setup(test_agent(Some(instructions.to_string()), Some("skill-1".to_string())));
+        let prompt = build_system_prompt(&setup, None);
+        assert!(prompt.contains("Additional role-specific instructions"));
+        assert!(prompt.contains(instructions));
+    }
+
+    /// A blank/whitespace-only `system_prompt` (shouldn't normally happen —
+    /// `agent_skills::insert` requires non-empty `instructions` — but is a
+    /// cheap thing to get right) must not produce an empty, pointless
+    /// section.
+    #[test]
+    fn build_system_prompt_omits_the_skill_section_for_blank_system_prompt() {
+        let setup = test_run_setup(test_agent(Some("   ".to_string()), None));
+        let prompt = build_system_prompt(&setup, None);
+        assert!(!prompt.contains("Additional role-specific instructions"));
+    }
+
+    /// Memory context and the skill's system prompt are independent,
+    /// additive sections — both must be able to appear together.
+    #[test]
+    fn build_system_prompt_includes_both_skill_instructions_and_memory_context() {
+        let setup = test_run_setup(test_agent(Some("Be terse.".to_string()), Some("skill-1".to_string())));
+        let prompt = build_system_prompt(&setup, Some("Relevant memory:\n- fixed a similar bug before"));
+        assert!(prompt.contains("Be terse."));
+        assert!(prompt.contains("Relevant memory"));
+    }
 }

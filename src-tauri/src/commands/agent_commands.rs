@@ -14,11 +14,12 @@ use uuid::Uuid;
 use crate::commands::run_blocking;
 use crate::db::models::{Agent, Workspace, WorkspaceKind};
 use crate::db::repository::{
-    agent_runs as agent_runs_repo, agents as agents_repo, model_configs as model_configs_repo,
-    repositories as repositories_repo, workspaces as workspaces_repo,
+    agent_runs as agent_runs_repo, agent_skills as agent_skills_repo, agents as agents_repo,
+    model_configs as model_configs_repo, repositories as repositories_repo, workspaces as workspaces_repo,
 };
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
+use rusqlite::Connection;
 
 /// Lowercases `name`, collapses runs of non-alphanumeric characters into a
 /// single `-`, and trims leading/trailing `-` — for embedding a human agent
@@ -47,9 +48,13 @@ fn slugify(name: &str) -> String {
 }
 
 /// Creates a new agent (status `idle`) for `project_id`'s (Phase 1: single)
-/// repository.
+/// repository. Phase 5 M19: `skill_id`, when given, must name an existing
+/// `agent_skills` row — its `instructions` are copied into the new agent's
+/// `system_prompt` and its id recorded as `skill_id` (real application, not
+/// a stored-but-unused reference — see `agents_repo::insert`'s own docs).
+/// `None` is today's plain, unrestricted agent, unchanged.
 #[tauri::command]
-pub async fn create_agent(app: AppHandle, project_id: String, name: String) -> Result<Agent, String> {
+pub async fn create_agent(app: AppHandle, project_id: String, name: String, skill_id: Option<String>) -> Result<Agent, String> {
     run_blocking(move || -> AppResult<Agent> {
         let state = app.state::<AppState>();
         let conn = state.db.get()?;
@@ -63,9 +68,36 @@ pub async fn create_agent(app: AppHandle, project_id: String, name: String) -> R
             AppError::NotFound(format!("no repository registered for project {project_id}"))
         })?;
 
-        agents_repo::insert(&conn, &project_id, &repository.id, name)
+        let skill = match &skill_id {
+            Some(id) => {
+                Some(agent_skills_repo::get_by_id(&conn, id)?.ok_or_else(|| AppError::NotFound(format!("agent skill {id} not found")))?)
+            }
+            None => None,
+        };
+
+        agents_repo::insert(&conn, &project_id, &repository.id, name, skill.as_ref())
     })
     .await
+}
+
+/// Resolves which real `model_id` (the string the Anthropic API itself
+/// takes, e.g. `"claude-sonnet-5"`) a new run of `agent` should use. Phase 5
+/// M19: if `agent` was created from a skill that names a
+/// `preferred_model_id` (and that `model_configs` row still exists), that
+/// override wins; otherwise this falls back to exactly today's behavior —
+/// the configured default model config, or the hardcoded
+/// `"claude-sonnet-5"` if even that is missing.
+fn resolve_model_id_for_agent(conn: &Connection, agent: &Agent) -> AppResult<String> {
+    if let Some(skill_id) = &agent.skill_id {
+        if let Some(skill) = agent_skills_repo::get_by_id(conn, skill_id)? {
+            if let Some(preferred_model_id) = &skill.preferred_model_id {
+                if let Some(model) = model_configs_repo::get_by_id(conn, preferred_model_id)? {
+                    return Ok(model.model_id);
+                }
+            }
+        }
+    }
+    Ok(model_configs_repo::get_default(conn)?.map(|m| m.model_id).unwrap_or_else(|| "claude-sonnet-5".to_string()))
 }
 
 /// All agents for `project_id`, most recently created first.
@@ -129,9 +161,7 @@ pub async fn start_worktree_for_agent(
             .git_service
             .add_worktree(&repo_root, &worktree_path, &branch_name, &base_branch)?;
 
-        let model_id = model_configs_repo::get_default(&conn)?
-            .map(|m| m.model_id)
-            .unwrap_or_else(|| "claude-sonnet-5".to_string());
+        let model_id = resolve_model_id_for_agent(&conn, &agent)?;
 
         let run = agent_runs_repo::insert_queued(&conn, &agent.id, task_prompt, &model_id)?;
 
@@ -192,5 +222,75 @@ mod tests {
     fn slugify_falls_back_when_nothing_alphanumeric() {
         assert_eq!(slugify("!!!"), "agent");
         assert_eq!(slugify(""), "agent");
+    }
+
+    fn setup_conn() -> Connection {
+        let mut conn = Connection::open_in_memory().expect("open in-memory db");
+        crate::db::migrations::run_migrations(&mut conn).expect("run migrations");
+        conn.execute("INSERT INTO projects (id, name) VALUES ('p1', 'Test Project')", []).expect("insert project");
+        conn.execute("INSERT INTO repositories (id, project_id, root_path) VALUES ('r1', 'p1', '/tmp/r1')", [])
+            .expect("insert repository");
+        conn
+    }
+
+    /// Phase 5 M19's core "skill application" property for model
+    /// selection: an agent created from a skill with a real
+    /// `preferred_model_id` must have *that* model resolved for its runs,
+    /// overriding the configured default — not just store the preference
+    /// and ignore it.
+    #[test]
+    fn resolve_model_id_for_agent_prefers_the_skills_model_over_the_default() {
+        let conn = setup_conn();
+        // The seeded default is 'default-sonnet' / 'claude-sonnet-5'. Add a
+        // second, non-default model config for the skill to prefer.
+        conn.execute(
+            "INSERT INTO model_configs (id, provider, model_id, display_name, is_default, max_output_tokens) \
+             VALUES ('opus-cfg', 'anthropic', 'claude-opus-5', 'Claude Opus 5', 0, 8192)",
+            [],
+        )
+        .expect("insert model config");
+
+        let skill = crate::db::repository::agent_skills::insert(
+            &conn,
+            "Opus Preferring Skill",
+            None,
+            "instructions",
+            &crate::db::repository::agent_skills::default_tools_json(),
+            Some("opus-cfg"),
+        )
+        .expect("insert skill");
+
+        let agent = agents_repo::insert(&conn, "p1", "r1", "Opus Agent", Some(&skill)).expect("insert agent");
+        let model_id = resolve_model_id_for_agent(&conn, &agent).expect("resolve_model_id_for_agent");
+        assert_eq!(model_id, "claude-opus-5");
+    }
+
+    /// No skill at all must fall back to exactly today's behavior: the
+    /// configured default model config.
+    #[test]
+    fn resolve_model_id_for_agent_falls_back_to_default_without_a_skill() {
+        let conn = setup_conn();
+        let agent = agents_repo::insert(&conn, "p1", "r1", "Plain Agent", None).expect("insert agent");
+        let model_id = resolve_model_id_for_agent(&conn, &agent).expect("resolve_model_id_for_agent");
+        assert_eq!(model_id, "claude-sonnet-5");
+    }
+
+    /// A skill with no `preferred_model_id` set at all must also fall back
+    /// to the default — the override is opt-in per skill.
+    #[test]
+    fn resolve_model_id_for_agent_falls_back_to_default_when_skill_has_no_preference() {
+        let conn = setup_conn();
+        let skill = crate::db::repository::agent_skills::insert(
+            &conn,
+            "No Preference Skill",
+            None,
+            "instructions",
+            &crate::db::repository::agent_skills::default_tools_json(),
+            None,
+        )
+        .expect("insert skill");
+        let agent = agents_repo::insert(&conn, "p1", "r1", "Agent", Some(&skill)).expect("insert agent");
+        let model_id = resolve_model_id_for_agent(&conn, &agent).expect("resolve_model_id_for_agent");
+        assert_eq!(model_id, "claude-sonnet-5");
     }
 }

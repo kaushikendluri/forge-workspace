@@ -121,6 +121,8 @@ export interface Agent {
   name: string;
   status: AgentStatus;
   systemPrompt: string | null;
+  /** Phase 5 M19: the Agent Skill this agent was created from, if any. */
+  skillId: string | null;
   createdAt: IsoDateTime;
   updatedAt: IsoDateTime;
 }
@@ -592,3 +594,38 @@ export interface AgentMemory {
   relevanceTags: string;
   createdAt: IsoDateTime;
 }
+
+/**
+ * Phase 5 M19: one reusable, named specialist agent configuration — name,
+ * description, instructions (copied into a created agent's `systemPrompt`),
+ * allowed tools (`toolsJson`: a JSON array of real tool names, or the
+ * sentinel `["*"]` meaning "every tool, unrestricted" — see
+ * `src-tauri/migrations/0012_agent_skills.sql`'s own docs), and an optional
+ * preferred model (a plain `ModelConfig.id` reference). Mirrors
+ * `src-tauri/src/db/models.rs`'s `AgentSkill`.
+ */
+export interface AgentSkill {
+  id: string;
+  name: string;
+  description: string | null;
+  instructions: string;
+  toolsJson: string;
+  preferredModelId: string | null;
+  createdAt: IsoDateTime;
+  updatedAt: IsoDateTime;
+}
+
+/**
+ * Phase 5 M19: one entry of the real tool catalogue
+ * (`agent::schema::all_tool_definitions`), exposed via `listAvailableTools`
+ * so the Skills page's tool checklist is built from the same source of
+ * truth the backend validates `AgentSkill.toolsJson` against. Mirrors
+ * `src-tauri/src/commands/agent_skill_commands.rs`'s `ToolCatalogueEntryDto`.
+ */
+export interface ToolCatalogueEntryDto {
+  name: string;
+  description: string;
+}
+
+/** The sentinel `toolsJson` array element meaning "every tool, unrestricted". */
+export const ALL_TOOLS_SENTINEL = "*";

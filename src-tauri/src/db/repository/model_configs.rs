@@ -43,3 +43,31 @@ pub fn get_default(conn: &Connection) -> AppResult<Option<ModelConfig>> {
     .optional()
     .map_err(Into::into)
 }
+
+/// Phase 5 M19: looks up one model config by its id — used to resolve an
+/// Agent Skill's `preferred_model_id` (itself just a reference to a row in
+/// this table) into the real `model_id` string `agent_runs.model_id` needs,
+/// at run-start time (`commands::agent_commands::start_worktree_for_agent`).
+pub fn get_by_id(conn: &Connection, id: &str) -> AppResult<Option<ModelConfig>> {
+    use rusqlite::OptionalExtension;
+    conn.query_row(&format!("SELECT {SELECT_COLUMNS} FROM model_configs WHERE id = ?1"), rusqlite::params![id], row_to_model_config)
+        .optional()
+        .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::migrations::run_migrations;
+
+    #[test]
+    fn get_by_id_finds_the_seeded_default_and_none_for_unknown() {
+        let mut conn = Connection::open_in_memory().expect("open in-memory db");
+        run_migrations(&mut conn).expect("run migrations");
+
+        let found = get_by_id(&conn, "default-sonnet").expect("get_by_id").expect("seeded row exists");
+        assert_eq!(found.model_id, "claude-sonnet-5");
+
+        assert!(get_by_id(&conn, "nonexistent").expect("get_by_id").is_none());
+    }
+}

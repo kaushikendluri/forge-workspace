@@ -286,6 +286,22 @@ pub fn conflict_resolver_tool_definitions() -> Vec<ToolDefinition> {
     all_tool_definitions().into_iter().filter(|d| CONFLICT_RESOLVER_TOOL_NAMES.contains(&d.name.as_str())).collect()
 }
 
+/// Phase 5 M19: the same "filter `all_tool_definitions` down to a named
+/// subset" mechanism [`reviewer_tool_definitions`]/
+/// [`conflict_resolver_tool_definitions`] already use, generalized to an
+/// arbitrary *dynamic* name list instead of a fixed `const` array — an
+/// Agent Skill's own `tools_json` restriction (`db::repository::
+/// agent_skills::parse_tools_json`), resolved once per run by
+/// `agent::tool_loop`. Reuses the exact same `ToolDefinition`s
+/// `all_tool_definitions` builds, so a tool's schema can never drift
+/// between an unrestricted run and a skill-restricted one. An unknown name
+/// in `names` (shouldn't happen — `agent_skills::insert`/`update` validate
+/// against this same catalogue before ever persisting one) simply matches
+/// nothing, the same way a typo in [`REVIEWER_TOOL_NAMES`] would.
+pub fn tool_definitions_for_names(names: &[String]) -> Vec<ToolDefinition> {
+    all_tool_definitions().into_iter().filter(|d| names.iter().any(|n| n == &d.name)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,5 +422,33 @@ mod tests {
         assert!(names.contains("git_status"));
         assert!(names.contains("git_diff"));
         assert_eq!(names.len(), 4);
+    }
+
+    /// Phase 5 M19: [`tool_definitions_for_names`] must behave exactly like
+    /// the fixed-list filters above, just parameterized — a dynamic subset
+    /// (an Agent Skill's own `tools_json`) comes back as exactly those
+    /// tools' real `ToolDefinition`s, nothing more.
+    #[test]
+    fn tool_definitions_for_names_returns_exactly_the_requested_subset() {
+        let names = vec!["read_file".to_string(), "git_status".to_string()];
+        let defs = tool_definitions_for_names(&names);
+        let returned: std::collections::HashSet<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(returned.len(), 2);
+        assert!(returned.contains("read_file"));
+        assert!(returned.contains("git_status"));
+        assert!(!returned.contains("write_file"));
+    }
+
+    #[test]
+    fn tool_definitions_for_names_empty_list_returns_no_tools() {
+        assert!(tool_definitions_for_names(&[]).is_empty());
+    }
+
+    #[test]
+    fn tool_definitions_for_names_ignores_unknown_names_rather_than_erroring() {
+        let names = vec!["read_file".to_string(), "not_a_real_tool".to_string()];
+        let defs = tool_definitions_for_names(&names);
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].name, "read_file");
     }
 }
