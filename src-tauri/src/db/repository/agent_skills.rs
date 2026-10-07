@@ -49,7 +49,8 @@ pub fn parse_tools_json(tools_json: &str) -> AppResult<Option<Vec<String>>> {
 /// sentinel) must be a real tool `all_tool_definitions()` actually defines.
 fn validate_tools_json(tools_json: &str) -> AppResult<()> {
     let Some(names) = parse_tools_json(tools_json)? else { return Ok(()) };
-    let known: std::collections::HashSet<&str> = all_tool_definitions().iter().map(|d| d.name.as_str()).collect();
+    let defs = all_tool_definitions();
+    let known: std::collections::HashSet<&str> = defs.iter().map(|d| d.name.as_str()).collect();
     for name in &names {
         if !known.contains(name.as_str()) {
             return Err(AppError::InvalidInput(format!(

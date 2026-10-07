@@ -443,7 +443,11 @@ async fn start_task_execution(app: &AppHandle, task: &Task) -> AppResult<String>
         None => task.title.clone(),
     };
 
-    let agent = agent_commands::create_agent(app.clone(), task.project_id.clone(), agent_name).await.map_err(AppError::Other)?;
+    // No skill selection for mission-scheduled tasks (M19 is scoped to the
+    // Agents page's own "New agent" flow) — `None` behaves exactly like
+    // today's plain, unrestricted agent.
+    let agent =
+        agent_commands::create_agent(app.clone(), task.project_id.clone(), agent_name, None).await.map_err(AppError::Other)?;
 
     let task_prompt = build_task_prompt(task);
     let workspace =
