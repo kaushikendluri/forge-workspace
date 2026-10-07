@@ -159,6 +159,13 @@ pub fn run() {
             commands::brain_commands::get_project_brain,
             commands::brain_commands::regenerate_project_brain,
             commands::memory_commands::list_agent_memory,
+            commands::agent_skill_commands::list_available_tools,
+            commands::agent_skill_commands::list_agent_skills,
+            commands::agent_skill_commands::get_agent_skill,
+            commands::agent_skill_commands::create_agent_skill,
+            commands::agent_skill_commands::update_agent_skill,
+            commands::agent_skill_commands::delete_agent_skill,
+            commands::agent_skill_commands::duplicate_agent_skill,
         ])
         .run(tauri::generate_context!())
         .expect("error while running forge-workspace");

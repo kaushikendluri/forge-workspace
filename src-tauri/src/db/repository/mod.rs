@@ -6,6 +6,7 @@ pub mod activity_events;
 pub mod agent_memory;
 pub mod agent_messages;
 pub mod agent_runs;
+pub mod agent_skills;
 pub mod agents;
 pub mod missions;
 pub mod model_configs;

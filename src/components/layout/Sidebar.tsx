@@ -36,15 +36,10 @@ interface DisabledNavItem {
 const workspaceItems: NavItem[] = [
   { label: "Projects", to: "/projects", icon: FolderGit2 },
   { label: "Agents", to: "/agents", icon: Bot },
+  { label: "Skills", to: "/skills", icon: Sparkles },
   { label: "Tasks", to: "/tasks", icon: ListChecks },
   { label: "Activity", to: "/activity", icon: Activity },
 ];
-
-const skillsAndSettingsDisabled: DisabledNavItem = {
-  label: "Skills",
-  icon: Sparkles,
-  reason: "Coming in a later phase",
-};
 
 function SidebarLink({ item, collapsed }: { item: NavItem; collapsed: boolean }) {
   const link = (
@@ -175,7 +170,6 @@ export function Sidebar() {
 
         <div className="my-2 h-px bg-border" />
 
-        <SidebarDisabledItem item={skillsAndSettingsDisabled} collapsed={collapsed} />
         <SidebarLink item={{ label: "Settings", to: "/settings", icon: SettingsIcon }} collapsed={collapsed} />
       </nav>
     </aside>

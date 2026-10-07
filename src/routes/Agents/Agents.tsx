@@ -5,8 +5,8 @@ import { EmptyState } from "@/components/empty-states/EmptyState";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useProjectStore } from "@/stores/useProjectStore";
-import { createAgent, listAgents, startWorktreeForAgent } from "@/lib/tauri";
-import type { Agent, Workspace } from "@/types/db";
+import { createAgent, listAgents, listAgentSkills, startWorktreeForAgent } from "@/lib/tauri";
+import type { Agent, AgentSkill, Workspace } from "@/types/db";
 
 function errorMessage(err: unknown): string {
   if (typeof err === "string") return err;
@@ -34,6 +34,19 @@ export function Agents() {
   const [newAgentName, setNewAgentName] = useState("");
   const [isCreating, setIsCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
+
+  // Phase 5 M19: a real skill picker for "New agent" — "" means "no skill /
+  // custom", any other value is an existing skill's id, threaded through to
+  // `create_agent` for real (instructions/tools/model actually get applied,
+  // not just stored and ignored).
+  const [skills, setSkills] = useState<AgentSkill[]>([]);
+  const [selectedSkillId, setSelectedSkillId] = useState<string>("");
+
+  useEffect(() => {
+    listAgentSkills()
+      .then(setSkills)
+      .catch(() => setSkills([]));
+  }, []);
 
   const [startingAgentId, setStartingAgentId] = useState<string | null>(null);
   const [startErrors, setStartErrors] = useState<Record<string, string>>({});
@@ -69,9 +82,10 @@ export function Agents() {
     setIsCreating(true);
     setCreateError(null);
     try {
-      const agent = await createAgent(activeProjectId, name);
+      const agent = await createAgent(activeProjectId, name, selectedSkillId || null);
       setAgents((prev) => [agent, ...prev]);
       setNewAgentName("");
+      setSelectedSkillId("");
     } catch (err) {
       setCreateError(errorMessage(err));
     } finally {
@@ -126,6 +140,19 @@ export function Agents() {
           placeholder="Agent name"
           className="w-64"
         />
+        <select
+          value={selectedSkillId}
+          onChange={(e) => setSelectedSkillId(e.target.value)}
+          className="h-9 rounded-md border border-border bg-background px-2 text-sm text-foreground"
+          aria-label="Agent skill"
+        >
+          <option value="">No skill (custom)</option>
+          {skills.map((skill) => (
+            <option key={skill.id} value={skill.id}>
+              {skill.name}
+            </option>
+          ))}
+        </select>
         <Button onClick={() => void handleCreateAgent()} disabled={isCreating || !newAgentName.trim()}>
           New agent
         </Button>

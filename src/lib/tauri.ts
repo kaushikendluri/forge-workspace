@@ -16,6 +16,7 @@ import type {
   AgentMessage,
   AgentRun,
   AgentRunFileDiffDto,
+  AgentSkill,
   BranchInfo,
   CommitInfo,
   DirEntryDto,
@@ -38,6 +39,7 @@ import type {
   TestRun,
   TestRunKind,
   ToolCall,
+  ToolCatalogueEntryDto,
   VisualSnapshotDto,
   Workspace,
 } from "@/types/db";
@@ -66,7 +68,7 @@ export interface CommandMap {
   list_workspaces: { args: { repositoryId: string }; result: Workspace[] };
   list_tasks: { args: { projectId: string }; result: Task[] };
   list_agents: { args: { projectId: string }; result: Agent[] };
-  create_agent: { args: { projectId: string; name: string }; result: Agent };
+  create_agent: { args: { projectId: string; name: string; skillId: string | null }; result: Agent };
   start_worktree_for_agent: { args: { agentId: string; taskPrompt: string }; result: Workspace };
   remove_agent_workspace: { args: { workspaceId: string }; result: void };
   start_agent_run: { args: { agentRunId: string }; result: void };
@@ -113,6 +115,32 @@ export interface CommandMap {
   get_project_brain: { args: { projectId: string }; result: ProjectBrainDto | null };
   regenerate_project_brain: { args: { projectId: string }; result: ProjectBrainDto };
   list_agent_memory: { args: { agentId: string }; result: AgentMemory[] };
+  list_available_tools: { args: Record<string, never>; result: ToolCatalogueEntryDto[] };
+  list_agent_skills: { args: Record<string, never>; result: AgentSkill[] };
+  get_agent_skill: { args: { skillId: string }; result: AgentSkill | null };
+  create_agent_skill: {
+    args: {
+      name: string;
+      description: string | null;
+      instructions: string;
+      toolsJson: string | null;
+      preferredModelId: string | null;
+    };
+    result: AgentSkill;
+  };
+  update_agent_skill: {
+    args: {
+      skillId: string;
+      name: string;
+      description: string | null;
+      instructions: string;
+      toolsJson: string | null;
+      preferredModelId: string | null;
+    };
+    result: AgentSkill;
+  };
+  delete_agent_skill: { args: { skillId: string }; result: void };
+  duplicate_agent_skill: { args: { skillId: string }; result: AgentSkill };
 }
 
 /**
@@ -322,9 +350,14 @@ export async function listAgents(projectId: string): Promise<Agent[]> {
   return invokeCommand("list_agents", { projectId });
 }
 
-/** Creates a new agent (status `idle`) for `projectId`'s repository. */
-export async function createAgent(projectId: string, name: string): Promise<Agent> {
-  return invokeCommand("create_agent", { projectId, name });
+/**
+ * Creates a new agent (status `idle`) for `projectId`'s repository. Phase 5
+ * M19: `skillId`, when given, must name an existing agent skill — its
+ * instructions/tools/preferred model are applied for real (copied into the
+ * agent's `systemPrompt`, and resolved at run-start time).
+ */
+export async function createAgent(projectId: string, name: string, skillId: string | null = null): Promise<Agent> {
+  return invokeCommand("create_agent", { projectId, name, skillId });
 }
 
 /**
@@ -527,4 +560,61 @@ export async function regenerateProjectBrain(projectId: string): Promise<Project
  */
 export async function listAgentMemory(agentId: string): Promise<AgentMemory[]> {
   return invokeCommand("list_agent_memory", { agentId });
+}
+
+/**
+ * Phase 5 M19: the real tool catalogue (`agent::schema::all_tool_definitions`)
+ * a skill's tool checklist is built from — the same source of truth the
+ * backend validates `AgentSkill.toolsJson` against, never a separately
+ * hardcoded frontend list.
+ */
+export async function listAvailableTools(): Promise<ToolCatalogueEntryDto[]> {
+  return invokeCommand("list_available_tools", {});
+}
+
+/** All agent skills, alphabetically by name. */
+export async function listAgentSkills(): Promise<AgentSkill[]> {
+  return invokeCommand("list_agent_skills", {});
+}
+
+/** One agent skill by id, or `null` if it doesn't exist. */
+export async function getAgentSkill(skillId: string): Promise<AgentSkill | null> {
+  return invokeCommand("get_agent_skill", { skillId });
+}
+
+/**
+ * Creates a new agent skill. `toolsJson` should be a JSON-encoded array of
+ * real tool names (or `["*"]` for "all tools") — pass `null` to default to
+ * "all tools", matching today's unrestricted agent behavior.
+ */
+export async function createAgentSkill(
+  name: string,
+  description: string | null,
+  instructions: string,
+  toolsJson: string | null,
+  preferredModelId: string | null,
+): Promise<AgentSkill> {
+  return invokeCommand("create_agent_skill", { name, description, instructions, toolsJson, preferredModelId });
+}
+
+/** Full update of an existing skill's editable fields. */
+export async function updateAgentSkill(
+  skillId: string,
+  name: string,
+  description: string | null,
+  instructions: string,
+  toolsJson: string | null,
+  preferredModelId: string | null,
+): Promise<AgentSkill> {
+  return invokeCommand("update_agent_skill", { skillId, name, description, instructions, toolsJson, preferredModelId });
+}
+
+/** Deletes an agent skill. Agents previously created from it are unaffected (their `skillId` becomes `null`). */
+export async function deleteAgentSkill(skillId: string): Promise<void> {
+  return invokeCommand("delete_agent_skill", { skillId });
+}
+
+/** A real duplicate: a fresh id, name suffixed "Copy of <original name>", everything else copied verbatim. */
+export async function duplicateAgentSkill(skillId: string): Promise<AgentSkill> {
+  return invokeCommand("duplicate_agent_skill", { skillId });
 }
