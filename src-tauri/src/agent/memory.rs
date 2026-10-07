@@ -164,7 +164,7 @@ pub fn extract_memories_from_run(
 ) -> Vec<ExtractedMemory> {
     let mut memories = Vec::new();
 
-    let non_empty = |s: Option<&str>| s.map(str::trim).filter(|s| !s.is_empty());
+    let non_empty = |s: Option<&str>| s.map(str::trim).filter(move |s| !s.is_empty());
 
     match status {
         AgentRunStatus::Completed => {
