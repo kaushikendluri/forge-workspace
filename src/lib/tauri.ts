@@ -84,6 +84,9 @@ export interface CommandMap {
   set_api_key: { args: { key: string }; result: void };
   has_api_key: { args: Record<string, never>; result: boolean };
   clear_api_key: { args: Record<string, never>; result: void };
+  set_provider_api_key: { args: { provider: string; key: string }; result: void };
+  has_provider_api_key: { args: { provider: string }; result: boolean };
+  clear_provider_api_key: { args: { provider: string }; result: void };
   list_model_configs: { args: Record<string, never>; result: ModelConfig[] };
   list_notifications: { args: { projectId: string | null }; result: Notification[] };
   mark_notification_read: { args: { id: string }; result: void };
@@ -259,6 +262,25 @@ export async function hasApiKey(): Promise<boolean> {
 /** Removes the stored Anthropic API key, if any. */
 export async function clearApiKey(): Promise<void> {
   return invokeCommand("clear_api_key", {});
+}
+
+/**
+ * Phase 5 M20: stores `key` in the OS keychain for `provider` (one of
+ * `"anthropic"` / `"openai"` / `"google"` / `"openrouter"`) — the
+ * multi-provider counterpart to `setApiKey`, which stays Anthropic-only.
+ */
+export async function setProviderApiKey(provider: string, key: string): Promise<void> {
+  return invokeCommand("set_provider_api_key", { provider, key });
+}
+
+/** Whether an API key is currently stored for `provider`. Never returns the key itself. */
+export async function hasProviderApiKey(provider: string): Promise<boolean> {
+  return invokeCommand("has_provider_api_key", { provider });
+}
+
+/** Removes the stored API key for `provider`, if any. */
+export async function clearProviderApiKey(provider: string): Promise<void> {
+  return invokeCommand("clear_provider_api_key", { provider });
 }
 
 /** The known model configs (seeded with one Claude Sonnet 5 default), default first. */

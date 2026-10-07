@@ -24,11 +24,13 @@ use serde::Serialize;
 use tauri::{AppHandle, Manager};
 use tokio_util::sync::CancellationToken;
 
+use crate::agent::model_resolution::{resolve_model_config, ModelRole};
+use crate::agent::provider;
 use crate::commands::run_blocking;
 use crate::db::models::{AgentMessage, Mission, MissionStatus, ReviewStatus, Task, TaskPriority};
 use crate::db::repository::{
-    agent_messages as agent_messages_repo, missions as missions_repo, model_configs as model_configs_repo,
-    repositories as repositories_repo, reviews as reviews_repo, tasks as tasks_repo,
+    agent_messages as agent_messages_repo, missions as missions_repo, repositories as repositories_repo,
+    reviews as reviews_repo, tasks as tasks_repo,
 };
 use crate::error::{AppError, AppResult};
 use crate::git::{GitCliService, GitService};
@@ -37,9 +39,6 @@ use crate::orchestrator::scheduler::{self, BoardColumn};
 use crate::os_adapter;
 use crate::secrets;
 use crate::state::AppState;
-
-const FALLBACK_MODEL_ID: &str = "claude-sonnet-5";
-const FALLBACK_MAX_TOKENS: u32 = 4096;
 
 fn normalize_priority(raw: &str) -> TaskPriority {
     match raw.to_ascii_lowercase().as_str() {
@@ -134,9 +133,9 @@ pub async fn create_mission(app: AppHandle, project_id: String, objective: Strin
 
     let project_id_for_setup = project_id.clone();
     let objective_for_setup = objective.clone();
-    let (mission, repo_root, model_id, max_tokens) = run_blocking({
+    let (mission, repo_root, model_id, max_tokens, provider_name) = run_blocking({
         let app = app.clone();
-        move || -> AppResult<(Mission, PathBuf, String, u32)> {
+        move || -> AppResult<(Mission, PathBuf, String, u32, String)> {
             let state = app.state::<AppState>();
             let conn = state.db.get()?;
 
@@ -146,11 +145,14 @@ pub async fn create_mission(app: AppHandle, project_id: String, objective: Strin
 
             let mission = missions_repo::insert(&conn, &project_id_for_setup, &objective_for_setup)?;
 
-            let default_model = model_configs_repo::get_default(&conn)?;
-            let model_id = default_model.as_ref().map(|m| m.model_id.clone()).unwrap_or_else(|| FALLBACK_MODEL_ID.to_string());
-            let max_tokens = default_model.map(|m| m.max_output_tokens as u32).unwrap_or(FALLBACK_MAX_TOKENS);
+            // Phase 5 M20: the mission planner is the `Orchestrator` role —
+            // no explicit override or skill preference applies at the
+            // mission level, so this is just "configured role default, else
+            // the global default" (see `agent::model_resolution`'s own
+            // precedence docs).
+            let model = resolve_model_config(&conn, ModelRole::Orchestrator, None, None)?;
 
-            Ok((mission, PathBuf::from(repository.root_path), model_id, max_tokens))
+            Ok((mission, PathBuf::from(repository.root_path), model.model_id, model.max_output_tokens as u32, model.provider))
         }
     })
     .await?;
@@ -158,16 +160,20 @@ pub async fn create_mission(app: AppHandle, project_id: String, objective: Strin
     // `keyring` is a synchronous OS call — same pattern `agent::tool_loop`
     // uses before starting an M6 run: never hang or silently produce an
     // empty plan when no key is configured, fail the mission clearly.
-    let api_key = tauri::async_runtime::spawn_blocking(|| secrets::get_secret(secrets::ANTHROPIC_API_KEY))
+    let secret_key = match provider::secret_key_for(&provider_name) {
+        Ok(key) => key,
+        Err(e) => return fail_mission(&app, &mission.id, &e.to_string()).await,
+    };
+    let api_key = tauri::async_runtime::spawn_blocking(move || secrets::get_secret(secret_key))
         .await
         .map_err(|e| format!("API key lookup panicked: {e}"))?
         .map_err(|e| e.to_string())?;
     let Some(api_key) = api_key else {
-        let msg = "No Anthropic API key is configured. Add one in Settings, then try again.".to_string();
+        let msg = format!("No {} API key is configured. Add one in Settings, then try again.", provider::display_name(&provider_name));
         return fail_mission(&app, &mission.id, &msg).await;
     };
 
-    let client = match crate::agent::anthropic_client::AnthropicClient::new(api_key) {
+    let client = match provider::for_name(&provider_name, api_key) {
         Ok(client) => client,
         Err(e) => return fail_mission(&app, &mission.id, &e.to_string()).await,
     };
@@ -180,7 +186,7 @@ pub async fn create_mission(app: AppHandle, project_id: String, objective: Strin
     let cancel = CancellationToken::new();
 
     let plan_result =
-        planner::propose_plan(&client, &model_id, max_tokens, &repo_root, git_service.as_ref(), &objective, &cancel).await;
+        planner::propose_plan(client.as_ref(), &model_id, max_tokens, &repo_root, git_service.as_ref(), &objective, &cancel).await;
 
     let plan = match plan_result {
         Ok(plan) => plan,
