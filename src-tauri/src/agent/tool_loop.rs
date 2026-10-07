@@ -22,9 +22,9 @@ use crate::db::models::{
     Agent, ActivityEventType, AgentRun, AgentRunStatus, AgentRunStopReason, AgentStatus, NotificationType, Task, Workspace,
 };
 use crate::db::repository::{
-    activity_events as activity_events_repo, agent_runs as agent_runs_repo, agents as agents_repo,
-    model_configs as model_configs_repo, notifications as notifications_repo, settings as settings_repo,
-    tasks as tasks_repo, workspaces as workspaces_repo,
+    activity_events as activity_events_repo, agent_memory as agent_memory_repo, agent_runs as agent_runs_repo,
+    agents as agents_repo, model_configs as model_configs_repo, notifications as notifications_repo,
+    settings as settings_repo, tasks as tasks_repo, tool_calls as tool_calls_repo, workspaces as workspaces_repo,
 };
 use crate::db::DbConnection;
 use crate::error::{AppError, AppResult};
@@ -36,6 +36,7 @@ use crate::state::AppState;
 use super::anthropic_client::{AnthropicClient, AssistantContentBlock, ContentBlockParam, MessageParam, StreamOutcome};
 use super::events as agent_events;
 use super::executor::{run_one_tool_call, ExecutedTool};
+use super::memory::{self as agent_memory, DEFAULT_RETRIEVAL_CAP};
 use super::schema::{all_tool_definitions, send_message_tool_definition};
 use super::test_fix::{TestFixEvent, TestFixTracker};
 use super::tools::{MissionContext, ToolContext};
@@ -186,8 +187,12 @@ fn load_run_setup(conn: &Connection, agent_run_id: &str) -> AppResult<RunSetup> 
     })
 }
 
-fn build_system_prompt(setup: &RunSetup) -> String {
-    format!(
+/// `memory_context` is the already-ranked-and-capped [`agent_memory::render_memory_context`]
+/// output for this agent (`None` when nothing in its past memory overlaps
+/// with this run's task) — appended as its own clearly-labeled section so
+/// the model can see it's retrieved context, not part of the task itself.
+fn build_system_prompt(setup: &RunSetup, memory_context: Option<&str>) -> String {
+    let mut prompt = format!(
         "You are an autonomous coding agent named \"{agent_name}\", working inside a dedicated, isolated git \
          worktree at `{workspace_root}` on branch `{branch}` (based on `{base}`). Nothing outside this worktree is \
          reachable through your tools.\n\n\
@@ -206,7 +211,12 @@ fn build_system_prompt(setup: &RunSetup) -> String {
         branch = setup.workspace.branch_name,
         base = setup.workspace.base_branch.as_deref().unwrap_or("(unknown)"),
         task = setup.agent_run.task_prompt,
-    )
+    );
+    if let Some(context) = memory_context {
+        prompt.push('\n');
+        prompt.push_str(context);
+    }
+    prompt
 }
 
 /// Builds a `test_fix_cycle` activity event's `payload_json` for one
@@ -388,6 +398,29 @@ async fn finish_run(
         )?;
         agent_events::notification_created(app, notification)?;
 
+        // M18: extract this run's own small set of memory entries
+        // (completed-work summary / real failure reason / files actually
+        // touched — see `agent::memory::extract_memories_from_run`'s docs
+        // for why this is purely mechanical, no second AI call) and
+        // persist them for this *agent* (never another agent — see
+        // `migrations/0011_agent_memory.sql`'s scoping rationale) to
+        // retrieve from on a future run. Best-effort: a failure here would
+        // mean a run that otherwise finished cleanly gets reported as
+        // failed just because memory bookkeeping hiccuped, which would be
+        // a worse outcome than simply not remembering this one run.
+        let run_tool_calls = tool_calls_repo::list_for_run(&conn, agent_run_id).unwrap_or_default();
+        for extracted in agent_memory::extract_memories_from_run(status, notification_detail, error_message.as_deref(), &run_tool_calls)
+        {
+            let _ = agent_memory_repo::insert(
+                &conn,
+                &run.agent_id,
+                Some(agent_run_id),
+                extracted.kind,
+                &extracted.content,
+                &extracted.relevance_tags,
+            );
+        }
+
         run.agent_id
     };
 
@@ -465,7 +498,20 @@ async fn run_agent_loop_inner(app: &AppHandle, agent_run_id: &str, cancel: &Canc
         tool_defs.push(send_message_tool_definition());
     }
     let workspace_root = PathBuf::from(&setup.workspace.path);
-    let system_prompt = build_system_prompt(&setup);
+
+    // M18: retrieve a small, genuinely relevant slice of this *agent's* own
+    // past memory (decisions/files touched/errors/completed work from its
+    // earlier runs — never another agent's) and fold it into the system
+    // prompt as its own labeled section. `rank_relevant_memories` is what
+    // keeps this selective: an agent with plenty of memory but nothing
+    // relevant to *this* task gets `None` here, not a dump of everything.
+    let all_memory = {
+        let conn = get_conn(app)?;
+        agent_memory_repo::list_for_agent(&conn, &setup.agent.id)?
+    };
+    let relevant_memory = agent_memory::rank_relevant_memories(&setup.agent_run.task_prompt, &all_memory, DEFAULT_RETRIEVAL_CAP);
+    let memory_context = agent_memory::render_memory_context(&relevant_memory);
+    let system_prompt = build_system_prompt(&setup, memory_context.as_deref());
     let model_id = setup.agent_run.model_id.clone();
 
     // Fresh instances rather than reaching into `AppState` — both are cheap

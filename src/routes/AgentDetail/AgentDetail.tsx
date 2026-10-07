@@ -18,6 +18,7 @@ import {
   getRunDiff,
   getVisualSnapshotImage,
   listActivityEvents,
+  listAgentMemory,
   listAgentRuns,
   listAgents,
   listToolCalls,
@@ -33,6 +34,8 @@ import { toastError } from "@/stores/useToastStore";
 import { cn } from "@/lib/utils";
 import type {
   Agent,
+  AgentMemory,
+  AgentMemoryKind,
   AgentRunFileDiffDto,
   AgentRunStatus,
   MergeReadinessDto,
@@ -81,6 +84,21 @@ const REVIEW_SEVERITY_BADGE: Record<ReviewSeverity, { label: string; variant: "s
   medium: { label: "medium", variant: "default" },
   high: { label: "high", variant: "warning" },
   critical: { label: "critical", variant: "destructive" },
+};
+
+/** M18: label + badge color for each kind of extracted agent memory. */
+const MEMORY_KIND_LABEL: Record<AgentMemoryKind, string> = {
+  decision: "Decision",
+  file_context: "Touched file",
+  error: "Past error",
+  completed_work: "Completed work",
+};
+
+const MEMORY_KIND_BADGE: Record<AgentMemoryKind, "default" | "success" | "destructive" | "secondary"> = {
+  decision: "secondary",
+  file_context: "default",
+  error: "destructive",
+  completed_work: "success",
 };
 
 const REVIEW_STATUS_BADGE: Record<ReviewDto["status"], { label: string; variant: "default" | "success" | "destructive" }> = {
@@ -239,6 +257,96 @@ function ReviewPanel({ agentRunId }: { agentRunId: string }) {
           {requestError}
         </div>
       )}
+    </div>
+  );
+}
+
+/**
+ * M18: an agent's full accumulated memory — real entries extracted
+ * mechanically at the end of each of its past runs (a `report_completion`
+ * summary, files actually touched, a real failure reason), most recently
+ * created first. This is the honest full-history view for a human to
+ * browse; what actually gets injected into a *new* run's own system
+ * prompt is a much smaller, keyword-overlap-ranked subset of this,
+ * computed server-side (`agent::memory::rank_relevant_memories`) when that
+ * run starts — never this whole list dumped in. Scoped to the agent (not
+ * any single run), since memory persists and accumulates across every run
+ * on this agent.
+ */
+function MemoryPanel({ agentId }: { agentId: string }) {
+  const [memory, setMemory] = useState<AgentMemory[] | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  const refetch = () => {
+    listAgentMemory(agentId)
+      .then((result) => setMemory(result))
+      .catch((err) => setLoadError(errorMessage(err)));
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    setMemory(null);
+    setLoadError(null);
+    listAgentMemory(agentId)
+      .then((result) => {
+        if (!cancelled) setMemory(result);
+      })
+      .catch((err) => {
+        if (!cancelled) setLoadError(errorMessage(err));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [agentId]);
+
+  // A run's terminal status change is exactly when `finish_run` extracts
+  // and persists this agent's newest memory entries — refetch then rather
+  // than polling.
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    void (async () => {
+      unlisten = await onForgeEvent("agent-run:status-changed", () => {
+        if (!cancelled) refetch();
+      });
+    })();
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentId]);
+
+  if (loadError) {
+    return (
+      <div className="rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
+        Couldn't load this agent's memory: {loadError}
+      </div>
+    );
+  }
+  if (memory === null) {
+    return <p className="text-xs text-muted-foreground">Loading memory…</p>;
+  }
+  if (memory.length === 0) {
+    return (
+      <p className="text-xs text-muted-foreground">
+        No memory yet — this agent hasn't finished a run. A future run's prompt will stay focused on its own task
+        until it does.
+      </p>
+    );
+  }
+
+  return (
+    <div className="flex max-h-64 flex-col gap-1.5 overflow-y-auto">
+      {memory.map((entry) => (
+        <div key={entry.id} className="rounded border border-border/60 bg-surface px-2 py-1.5 text-xs">
+          <div className="flex items-center justify-between gap-2">
+            <Badge variant={MEMORY_KIND_BADGE[entry.kind]}>{MEMORY_KIND_LABEL[entry.kind]}</Badge>
+            <span className="text-[10px] text-subtle-foreground">{new Date(entry.createdAt).toLocaleString()}</span>
+          </div>
+          <p className="mt-1 whitespace-pre-wrap text-muted-foreground">{entry.content}</p>
+        </div>
+      ))}
     </div>
   );
 }
@@ -1066,6 +1174,11 @@ export function AgentDetail() {
       <div className="flex flex-col gap-2 overflow-hidden rounded-md border border-border p-3">
         <h2 className="text-sm font-medium text-foreground">Visual Regression</h2>
         <VisualRegressionPanel agentRunId={run.id} />
+      </div>
+
+      <div className="flex flex-col gap-2 overflow-hidden rounded-md border border-border p-3">
+        <h2 className="text-sm font-medium text-foreground">Memory</h2>
+        <MemoryPanel agentId={agent.id} />
       </div>
     </div>
   );

@@ -17,11 +17,13 @@
 //! - `test_fix`          — M13: bounded, visible tracking of the self-healing test-fix cycle
 //! - `reviewer`          — M14: the read-only reviewer agent (`run_review`)
 //! - `conflict_resolver` — M15: the bounded, scoped AI merge-conflict resolver
+//! - `memory`            — Phase 5 M18: per-agent memory extraction (end of a run) and retrieval ranking (start of the next)
 
 pub mod anthropic_client;
 pub mod conflict_resolver;
 pub mod events;
 pub mod executor;
+pub mod memory;
 pub mod path_guard;
 pub mod process;
 pub mod reviewer;

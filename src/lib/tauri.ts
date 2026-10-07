@@ -12,6 +12,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   ActivityEvent,
   Agent,
+  AgentMemory,
   AgentMessage,
   AgentRun,
   AgentRunFileDiffDto,
@@ -111,6 +112,7 @@ export interface CommandMap {
   create_visual_regression_follow_up_task: { args: { snapshotId: string }; result: Task };
   get_project_brain: { args: { projectId: string }; result: ProjectBrainDto | null };
   regenerate_project_brain: { args: { projectId: string }; result: ProjectBrainDto };
+  list_agent_memory: { args: { agentId: string }; result: AgentMemory[] };
 }
 
 /**
@@ -513,4 +515,16 @@ export async function getProjectBrain(projectId: string): Promise<ProjectBrainDt
  */
 export async function regenerateProjectBrain(projectId: string): Promise<ProjectBrainDto> {
   return invokeCommand("regenerate_project_brain", { projectId });
+}
+
+/**
+ * Phase 5 M18: `agentId`'s full accumulated memory, most recently created
+ * first — the honest "everything this agent has learned so far" view for
+ * a UI panel. Distinct from what actually gets injected into a new run's
+ * prompt, which is a small, keyword-overlap-ranked subset of this
+ * (`agent::memory::rank_relevant_memories`, applied server-side when a run
+ * starts) — this always returns the full list, un-filtered.
+ */
+export async function listAgentMemory(agentId: string): Promise<AgentMemory[]> {
+  return invokeCommand("list_agent_memory", { agentId });
 }
