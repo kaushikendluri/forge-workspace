@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::anthropic_client::{AnthropicClient, MessageParam, StreamOutcome, ToolDefinition};
+use crate::agent::anthropic_client::{MessageParam, StreamOutcome, ToolDefinition};
+use crate::agent::provider::ModelProvider;
 use crate::error::{AppError, AppResult};
 use crate::git::GitService;
 
@@ -176,7 +177,7 @@ pub(crate) fn shallow_top_level_listing(repo_root: &Path) -> String {
 /// responsible for turning that into a `missions.status = 'failed'` row
 /// rather than silently producing an empty plan.
 pub async fn propose_plan(
-    client: &AnthropicClient,
+    client: &dyn ModelProvider,
     model: &str,
     max_tokens: u32,
     repo_root: &Path,

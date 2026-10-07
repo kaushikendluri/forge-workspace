@@ -25,6 +25,7 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("../../migrations/0010_project_brain.sql")),
         M::up(include_str!("../../migrations/0011_agent_memory.sql")),
         M::up(include_str!("../../migrations/0012_agent_skills.sql")),
+        M::up(include_str!("../../migrations/0013_model_router.sql")),
     ])
 }
 

@@ -59,7 +59,8 @@ use crate::os_adapter;
 use crate::secrets;
 use crate::state::AppState;
 
-use super::anthropic_client::{AnthropicClient, ContentBlockParam, MessageParam, StreamOutcome};
+use super::anthropic_client::{ContentBlockParam, MessageParam, StreamOutcome};
+use super::provider::{self, ModelProvider};
 use super::schema::conflict_resolver_tool_definitions;
 use super::tool_loop::to_content_block_param;
 use super::tools::{dispatch_tool, MissionContext as ToolMissionContext, ToolContext, ToolRunOutcome};
@@ -173,23 +174,31 @@ pub async fn resolve_conflicts_with_agent(app: &AppHandle, agent_run_id: &str) -
     }
     let allowed_paths: HashSet<String> = initial_conflicts.iter().map(|f| normalize_path(&f.path)).collect();
 
-    let api_key = tauri::async_runtime::spawn_blocking(|| secrets::get_secret(secrets::ANTHROPIC_API_KEY))
-        .await
-        .map_err(|e| AppError::Other(format!("API key lookup panicked: {e}")))??;
-    let Some(api_key) = api_key else {
-        return Err(AppError::InvalidInput(
-            "No Anthropic API key is configured. Add one in Settings, then ask the agent to resolve conflicts again.".to_string(),
-        ));
-    };
-    let client = AnthropicClient::new(api_key)?;
-    let max_tokens = {
+    // Phase 5 M20: no dedicated role for the conflict resolver — it inherits
+    // whichever provider/model the original agent run itself used (the same
+    // `model_configs` lookup-by-`model_id` `max_tokens` already used), so
+    // resolving a conflict runs on the same model that wrote the code in
+    // the first place rather than introducing a second, separately-tuned
+    // choice for this one bounded, mechanical task.
+    let (provider_name, max_tokens) = {
         let conn = get_conn(app)?;
         model_configs_repo::list(&conn)?
             .into_iter()
             .find(|m| m.model_id == agent_run.model_id)
-            .map(|m| m.max_output_tokens as u32)
-            .unwrap_or(DEFAULT_MAX_TOKENS)
+            .map(|m| (m.provider, m.max_output_tokens as u32))
+            .unwrap_or_else(|| ("anthropic".to_string(), DEFAULT_MAX_TOKENS))
     };
+    let secret_key = provider::secret_key_for(&provider_name)?;
+    let api_key = tauri::async_runtime::spawn_blocking(move || secrets::get_secret(secret_key))
+        .await
+        .map_err(|e| AppError::Other(format!("API key lookup panicked: {e}")))??;
+    let Some(api_key) = api_key else {
+        return Err(AppError::InvalidInput(format!(
+            "No {} API key is configured. Add one in Settings, then ask the agent to resolve conflicts again.",
+            provider::display_name(&provider_name)
+        )));
+    };
+    let client = provider::for_name(&provider_name, api_key)?;
 
     let cancel = CancellationToken::new();
     let db_pool = app.state::<AppState>().db.clone();
@@ -229,7 +238,8 @@ pub async fn resolve_conflicts_with_agent(app: &AppHandle, agent_run_id: &str) -
             return Err(AppError::Other("conflict resolution was cancelled".to_string()));
         }
 
-        let outcome = client.stream_turn(&agent_run.model_id, max_tokens, &system, &messages, &tools, &cancel, |_text: &str| {}).await?;
+        let mut noop = |_text: &str| {};
+        let outcome = client.stream_turn(&agent_run.model_id, max_tokens, &system, &messages, &tools, &cancel, &mut noop).await?;
         let turn = match outcome {
             StreamOutcome::Turn(turn) => turn,
             StreamOutcome::Cancelled => return Err(AppError::Other("conflict resolution was cancelled".to_string())),
