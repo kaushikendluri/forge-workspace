@@ -62,10 +62,11 @@ use serde_json::json;
 use tauri::{AppHandle, Manager};
 use tokio_util::sync::CancellationToken;
 
+use crate::agent::model_resolution::{resolve_model_config, ModelRole};
 use crate::db::models::{AgentRunStatus, Review, ReviewFinding, ReviewSeverity, ReviewStatus, Task, TaskPriority};
 use crate::db::repository::{
-    agent_runs as agent_runs_repo, agents as agents_repo, model_configs as model_configs_repo, reviews as reviews_repo,
-    tasks as tasks_repo, workspaces as workspaces_repo,
+    agent_runs as agent_runs_repo, agents as agents_repo, reviews as reviews_repo, tasks as tasks_repo,
+    workspaces as workspaces_repo,
 };
 use crate::db::DbConnection;
 use crate::error::{AppError, AppResult};
@@ -74,7 +75,8 @@ use crate::os_adapter;
 use crate::secrets;
 use crate::state::AppState;
 
-use super::anthropic_client::{AnthropicClient, ContentBlockParam, MessageParam, StreamOutcome, ToolDefinition};
+use super::anthropic_client::{ContentBlockParam, MessageParam, StreamOutcome, ToolDefinition};
+use super::provider::{self, ModelProvider};
 use super::schema::reviewer_tool_definitions;
 use super::tool_loop::to_content_block_param;
 use super::tools::{dispatch_tool, MissionContext as ToolMissionContext, ToolContext, ToolRunOutcome};
@@ -86,7 +88,6 @@ use super::tools::{dispatch_tool, MissionContext as ToolMissionContext, ToolCont
 /// doing open-ended work.
 const MAX_CONTEXT_ITERATIONS: i64 = 6;
 const DEFAULT_TOOL_TIMEOUT_MS: u64 = 30_000;
-const DEFAULT_MAX_TOKENS: u32 = 8192;
 const SUBMIT_REVIEW_TOOL: &str = "submit_review";
 
 /// Out of 100. A review scoring at or above this is `passed`; below it is
@@ -275,7 +276,7 @@ fn context_system_prompt(task_prompt: &str, workspace_root: &str) -> String {
 /// every real tool result) for phase 2 to hand back to the model alongside
 /// the forced `submit_review` call.
 async fn gather_context(
-    client: &AnthropicClient,
+    client: &dyn ModelProvider,
     model: &str,
     max_tokens: u32,
     system: &str,
@@ -293,7 +294,8 @@ async fn gather_context(
             return Err(AppError::Other("review was cancelled".to_string()));
         }
 
-        let outcome = client.stream_turn(model, max_tokens, system, &messages, &tools, cancel, |_text: &str| {}).await?;
+        let mut noop = |_text: &str| {};
+        let outcome = client.stream_turn(model, max_tokens, system, &messages, &tools, cancel, &mut noop).await?;
         let turn = match outcome {
             StreamOutcome::Turn(turn) => turn,
             StreamOutcome::Cancelled => return Err(AppError::Other("review was cancelled".to_string())),
@@ -339,7 +341,7 @@ async fn gather_context(
 // ---------------------------------------------------------------------
 
 async fn request_review_submission(
-    client: &AnthropicClient,
+    client: &dyn ModelProvider,
     model: &str,
     max_tokens: u32,
     system: &str,
@@ -405,26 +407,33 @@ pub async fn run_review(app: &AppHandle, agent_run_id: &str) -> AppResult<Review
         (agent_run, agent, workspace)
     };
 
+    // Phase 5 M20: the reviewer is its own role (`Reviewer`) — resolved the
+    // same "configured role default, else the global default" way every
+    // other role is (see `agent::model_resolution`'s own precedence docs),
+    // independently of whichever model/provider actually did the work being
+    // reviewed.
+    let model = {
+        let conn = get_conn(app)?;
+        resolve_model_config(&conn, ModelRole::Reviewer, None, None)?
+    };
+    let provider_name = model.provider.clone();
+
     // Same "fail loudly, never silently produce a fake result" pattern
     // `agent::tool_loop::run_agent_loop_inner` uses before an M6 run starts.
-    let api_key = tauri::async_runtime::spawn_blocking(|| secrets::get_secret(secrets::ANTHROPIC_API_KEY))
+    let secret_key = provider::secret_key_for(&provider_name)?;
+    let api_key = tauri::async_runtime::spawn_blocking(move || secrets::get_secret(secret_key))
         .await
         .map_err(|e| AppError::Other(format!("API key lookup panicked: {e}")))??;
     let Some(api_key) = api_key else {
-        return Err(AppError::InvalidInput(
-            "No Anthropic API key is configured. Add one in Settings, then request a review again.".to_string(),
-        ));
+        return Err(AppError::InvalidInput(format!(
+            "No {} API key is configured. Add one in Settings, then request a review again.",
+            provider::display_name(&provider_name)
+        )));
     };
 
-    let client = AnthropicClient::new(api_key)?;
-    let max_tokens = {
-        let conn = get_conn(app)?;
-        model_configs_repo::list(&conn)?
-            .into_iter()
-            .find(|m| m.model_id == agent_run.model_id)
-            .map(|m| m.max_output_tokens as u32)
-            .unwrap_or(DEFAULT_MAX_TOKENS)
-    };
+    let client = provider::for_name(&provider_name, api_key)?;
+    let max_tokens = model.max_output_tokens as u32;
+    let model_id = model.model_id.clone();
 
     let os_adapter = os_adapter::current();
     let git_service: Box<dyn GitService> = Box::new(GitCliService::new(os_adapter.as_ref()));
@@ -465,8 +474,8 @@ pub async fn run_review(app: &AppHandle, agent_run_id: &str) -> AppResult<Review
     };
 
     let submission_result: AppResult<ReviewSubmission> = async {
-        let messages = gather_context(&client, &agent_run.model_id, max_tokens, &system, &ctx, &cancel).await?;
-        request_review_submission(&client, &agent_run.model_id, max_tokens, &system, &messages, &cancel).await
+        let messages = gather_context(client.as_ref(), &model_id, max_tokens, &system, &ctx, &cancel).await?;
+        request_review_submission(client.as_ref(), &model_id, max_tokens, &system, &messages, &cancel).await
     }
     .await;
 

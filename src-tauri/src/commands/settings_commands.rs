@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 use tauri::{AppHandle, Manager};
 
+use crate::agent::provider;
 use crate::commands::run_blocking;
 use crate::db::models::ModelConfig;
 use crate::db::repository::{model_configs as model_configs_repo, settings as settings_repo};
@@ -79,6 +80,47 @@ pub async fn has_api_key() -> Result<bool, String> {
 #[tauri::command]
 pub async fn clear_api_key() -> Result<(), String> {
     run_blocking(move || -> AppResult<()> { secrets::delete_secret(secrets::ANTHROPIC_API_KEY) }).await
+}
+
+/// Phase 5 M20: stores `key` in the OS keychain for `provider` (one of
+/// `"anthropic"`/`"openai"`/`"google"`/`"openrouter"` — see
+/// `agent::provider::secret_key_for`), the same account-per-provider pattern
+/// `set_api_key` already established for Anthropic alone. Kept as a
+/// separate command (rather than widening `set_api_key` itself) so the
+/// Anthropic-specific command every existing frontend call site already
+/// uses keeps working completely unchanged.
+#[tauri::command]
+pub async fn set_provider_api_key(provider: String, key: String) -> Result<(), String> {
+    run_blocking(move || -> AppResult<()> {
+        let trimmed = key.trim();
+        if trimmed.is_empty() {
+            return Err(AppError::InvalidInput("API key cannot be empty".to_string()));
+        }
+        let secret_key = provider::secret_key_for(&provider)?;
+        secrets::set_secret(secret_key, trimmed)
+    })
+    .await
+}
+
+/// Whether an API key is currently stored for `provider`. Never returns the
+/// key itself — only a boolean.
+#[tauri::command]
+pub async fn has_provider_api_key(provider: String) -> Result<bool, String> {
+    run_blocking(move || -> AppResult<bool> {
+        let secret_key = provider::secret_key_for(&provider)?;
+        Ok(secrets::get_secret(secret_key)?.is_some())
+    })
+    .await
+}
+
+/// Removes the stored API key for `provider`, if any.
+#[tauri::command]
+pub async fn clear_provider_api_key(provider: String) -> Result<(), String> {
+    run_blocking(move || -> AppResult<()> {
+        let secret_key = provider::secret_key_for(&provider)?;
+        secrets::delete_secret(secret_key)
+    })
+    .await
 }
 
 /// The known model configs (seeded with one Claude Sonnet 5 default),

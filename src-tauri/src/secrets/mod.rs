@@ -19,6 +19,15 @@ const SERVICE_NAME: &str = "forge-workspace";
 /// redesign of this module.
 pub const ANTHROPIC_API_KEY: &str = "anthropic_api_key";
 
+/// Phase 5 M20: the other three providers `agent::provider` knows how to
+/// build a [`crate::agent::provider::ModelProvider`] for — exactly what this
+/// module's own doc comment above predicted ("adding another provider's key
+/// later is just another `pub const`"). See `agent::provider::secret_key_for`
+/// for the `model_configs.provider` string -> this constant mapping.
+pub const OPENAI_API_KEY: &str = "openai_api_key";
+pub const GOOGLE_API_KEY: &str = "google_api_key";
+pub const OPENROUTER_API_KEY: &str = "openrouter_api_key";
+
 fn entry(key: &str) -> AppResult<Entry> {
     Entry::new(SERVICE_NAME, key)
         .map_err(|e| AppError::Other(format!("keychain unavailable for '{key}': {e}")))

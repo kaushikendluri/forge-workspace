@@ -18,14 +18,18 @@
 //! - `reviewer`          — M14: the read-only reviewer agent (`run_review`)
 //! - `conflict_resolver` — M15: the bounded, scoped AI merge-conflict resolver
 //! - `memory`            — Phase 5 M18: per-agent memory extraction (end of a run) and retrieval ranking (start of the next)
+//! - `provider`          — Phase 5 M20: the `ModelProvider` trait + real Anthropic/OpenAI/Google/OpenRouter implementations
+//! - `model_resolution`  — Phase 5 M20: the single per-role/skill/default model-selection precedence every call site shares
 
 pub mod anthropic_client;
 pub mod conflict_resolver;
 pub mod events;
 pub mod executor;
 pub mod memory;
+pub mod model_resolution;
 pub mod path_guard;
 pub mod process;
+pub mod provider;
 pub mod reviewer;
 pub mod schema;
 pub mod test_fix;

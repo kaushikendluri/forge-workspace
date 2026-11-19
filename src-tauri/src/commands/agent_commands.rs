@@ -11,11 +11,12 @@ use std::path::PathBuf;
 use tauri::{AppHandle, Manager};
 use uuid::Uuid;
 
+use crate::agent::model_resolution::{resolve_model_config, ModelRole};
 use crate::commands::run_blocking;
 use crate::db::models::{Agent, Workspace, WorkspaceKind};
 use crate::db::repository::{
     agent_runs as agent_runs_repo, agent_skills as agent_skills_repo, agents as agents_repo,
-    model_configs as model_configs_repo, repositories as repositories_repo, workspaces as workspaces_repo,
+    repositories as repositories_repo, workspaces as workspaces_repo,
 };
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
@@ -80,24 +81,21 @@ pub async fn create_agent(app: AppHandle, project_id: String, name: String, skil
     .await
 }
 
-/// Resolves which real `model_id` (the string the Anthropic API itself
-/// takes, e.g. `"claude-sonnet-5"`) a new run of `agent` should use. Phase 5
-/// M19: if `agent` was created from a skill that names a
-/// `preferred_model_id` (and that `model_configs` row still exists), that
-/// override wins; otherwise this falls back to exactly today's behavior —
-/// the configured default model config, or the hardcoded
-/// `"claude-sonnet-5"` if even that is missing.
+/// Resolves which real `model_id` a new run of `agent` should use, via the
+/// single shared precedence `agent::model_resolution::resolve_model_config`
+/// implements (M20): an agent created from a skill that names a
+/// `preferred_model_id` (M19, unchanged) wins over the `Coder` role's
+/// configured default (M20, new — unset on a fresh/existing install, so this
+/// falls straight through), which in turn wins over the global default. No
+/// explicit per-run override exists at this call site yet, so that tier is
+/// always `None` here.
 fn resolve_model_id_for_agent(conn: &Connection, agent: &Agent) -> AppResult<String> {
-    if let Some(skill_id) = &agent.skill_id {
-        if let Some(skill) = agent_skills_repo::get_by_id(conn, skill_id)? {
-            if let Some(preferred_model_id) = &skill.preferred_model_id {
-                if let Some(model) = model_configs_repo::get_by_id(conn, preferred_model_id)? {
-                    return Ok(model.model_id);
-                }
-            }
-        }
-    }
-    Ok(model_configs_repo::get_default(conn)?.map(|m| m.model_id).unwrap_or_else(|| "claude-sonnet-5".to_string()))
+    let skill_preferred_model_id = match &agent.skill_id {
+        Some(skill_id) => agent_skills_repo::get_by_id(conn, skill_id)?.and_then(|s| s.preferred_model_id),
+        None => None,
+    };
+    let model = resolve_model_config(conn, ModelRole::Coder, None, skill_preferred_model_id.as_deref())?;
+    Ok(model.model_id)
 }
 
 /// All agents for `project_id`, most recently created first.

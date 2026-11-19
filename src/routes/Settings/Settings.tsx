@@ -6,7 +6,15 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Separator } from "@/components/ui/separator";
-import { getSetting, isTauriRuntime, listModelConfigs, setSetting } from "@/lib/tauri";
+import {
+  clearProviderApiKey,
+  getSetting,
+  hasProviderApiKey,
+  isTauriRuntime,
+  listModelConfigs,
+  setProviderApiKey,
+  setSetting,
+} from "@/lib/tauri";
 import type { ModelConfig } from "@/types/db";
 
 function SettingsSection({
@@ -119,6 +127,103 @@ function ApiKeySection() {
 }
 
 /**
+ * Phase 5 M20: the same key + Save/Clear pattern `ApiKeySection` already
+ * established for Anthropic, generalized by `provider`/`label` for the
+ * other three real providers (`agent::provider` now has a real
+ * `ModelProvider` impl for each). Kept as its own local-state component
+ * (rather than folded into the Anthropic-specific, store-backed
+ * `ApiKeySection` above) so that component — and the `useSettingsStore`
+ * state/tests it already has — stays completely untouched by this
+ * milestone; this one talks straight to the new `set_provider_api_key`/
+ * `has_provider_api_key`/`clear_provider_api_key` commands instead.
+ */
+function ProviderApiKeySection({ provider, label, placeholder }: { provider: string; label: string; placeholder: string }) {
+  const [hasKey, setHasKey] = useState<boolean | null>(null);
+  const [input, setInput] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!isTauriRuntime()) {
+      setHasKey(false);
+      return;
+    }
+    hasProviderApiKey(provider)
+      .then(setHasKey)
+      .catch(() => setHasKey(false));
+  }, [provider]);
+
+  const handleSave = async () => {
+    setSaving(true);
+    setError(null);
+    try {
+      await setProviderApiKey(provider, input);
+      setHasKey(true);
+      setInput("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleClear = async () => {
+    setSaving(true);
+    setError(null);
+    try {
+      await clearProviderApiKey(provider);
+      setHasKey(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (!isTauriRuntime()) {
+    return null;
+  }
+
+  if (hasKey === null) {
+    return <p className="text-xs text-muted-foreground">Checking keychain…</p>;
+  }
+
+  if (hasKey) {
+    return (
+      <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-surface px-3 py-2.5">
+        <div className="flex items-center gap-2">
+          <Badge variant="success">Key configured</Badge>
+          <span className="text-xs text-muted-foreground">{label} API key stored in the OS keychain.</span>
+        </div>
+        <Button variant="outline" size="sm" onClick={() => void handleClear()} disabled={saving}>
+          Clear
+        </Button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex gap-2">
+        <Input
+          type="password"
+          placeholder={placeholder}
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          autoComplete="off"
+          className="max-w-xs"
+        />
+        <Button onClick={() => void handleSave()} disabled={saving || input.trim().length === 0}>
+          Save
+        </Button>
+      </div>
+      <p className="text-xs text-muted-foreground">No {label} key set. Stored in the OS keychain — never in the database.</p>
+      {error && <p className="text-xs text-destructive">{error}</p>}
+    </div>
+  );
+}
+
+/**
  * Read-only list of the known model configs (seeded with one Claude Sonnet 5
  * default by the M1 migration). Editing/adding models is a later milestone.
  */
@@ -152,6 +257,7 @@ function ModelConfigSection() {
         >
           <div className="flex items-center gap-2">
             <span className="text-sm font-medium text-foreground">{model.displayName}</span>
+            <Badge variant="outline">{model.provider}</Badge>
             {model.isDefault && <Badge variant="outline">Default</Badge>}
           </div>
           <span className="text-xs text-muted-foreground">
@@ -260,6 +366,117 @@ function MaxParallelAgentsSection() {
   );
 }
 
+/** The four `model.role.*` settings keys (M20) — see `agent::model_resolution::ModelRole::setting_key`. */
+const MODEL_ROLES: { key: string; label: string; description: string }[] = [
+  { key: "model.role.orchestrator", label: "Orchestrator", description: "Mission planning (Tasks tab)" },
+  { key: "model.role.coder", label: "Coder", description: "Normal agent runs" },
+  { key: "model.role.reviewer", label: "Reviewer", description: "Code review" },
+  { key: "model.role.utility", label: "Utility", description: "Project Brain analysis" },
+];
+
+/**
+ * Phase 5 M20: per-role model assignment — four dropdowns (one per
+ * `ModelRole`), each persisted as its own `model.role.<role>` setting (M4's
+ * generic `get_setting`/`set_setting` commands, no new backend plumbing)
+ * storing a `model_configs.id`. Leaving a dropdown on "Default" clears that
+ * setting entirely (rather than persisting an empty string) so
+ * `agent::model_resolution::resolve_model_config` falls through to the
+ * global default exactly as if it had never been set — the "nothing breaks
+ * for an existing install" guarantee this milestone promises.
+ */
+function ModelRoleSection() {
+  const [models, setModels] = useState<ModelConfig[] | null>(null);
+  const [assignments, setAssignments] = useState<Record<string, string>>({});
+  const [savingKey, setSavingKey] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!isTauriRuntime()) {
+      setModels([]);
+      return;
+    }
+    listModelConfigs()
+      .then(setModels)
+      .catch(() => setModels([]));
+  }, []);
+
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    Promise.all(MODEL_ROLES.map((role) => getSetting(role.key)))
+      .then((values) => {
+        const next: Record<string, string> = {};
+        MODEL_ROLES.forEach((role, i) => {
+          const value = values[i];
+          if (value) next[role.key] = value;
+        });
+        setAssignments(next);
+      })
+      .catch(() => {});
+  }, []);
+
+  const handleChange = async (roleKey: string, modelConfigId: string) => {
+    setSavingKey(roleKey);
+    setError(null);
+    try {
+      if (modelConfigId === "") {
+        // "Default" selected — clear the override rather than persist an
+        // empty string, so resolution falls through to the global default.
+        await setSetting(roleKey, "");
+        setAssignments((prev) => {
+          const next = { ...prev };
+          delete next[roleKey];
+          return next;
+        });
+      } else {
+        await setSetting(roleKey, modelConfigId);
+        setAssignments((prev) => ({ ...prev, [roleKey]: modelConfigId }));
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSavingKey(null);
+    }
+  };
+
+  if (!isTauriRuntime()) {
+    return <p className="text-xs text-muted-foreground">Model role assignment requires the desktop app runtime.</p>;
+  }
+
+  if (models === null) {
+    return <p className="text-xs text-muted-foreground">Loading…</p>;
+  }
+
+  return (
+    <div className="flex flex-col gap-3">
+      {MODEL_ROLES.map((role) => (
+        <div key={role.key} className="flex items-center justify-between gap-3">
+          <div>
+            <p className="text-sm font-medium text-foreground">{role.label}</p>
+            <p className="text-xs text-muted-foreground">{role.description}</p>
+          </div>
+          <select
+            className="h-9 min-w-[14rem] rounded-md border border-border bg-surface px-2 text-sm text-foreground"
+            value={assignments[role.key] ?? ""}
+            disabled={savingKey === role.key}
+            onChange={(e) => void handleChange(role.key, e.target.value)}
+          >
+            <option value="">Default</option>
+            {models.map((model) => (
+              <option key={model.id} value={model.id}>
+                {model.displayName} ({model.provider})
+              </option>
+            ))}
+          </select>
+        </div>
+      ))}
+      <p className="text-xs text-muted-foreground">
+        Leaving a role on "Default" uses the global default model config above.
+      </p>
+      {error && <p className="text-xs text-destructive">{error}</p>}
+    </div>
+  );
+}
+
 export function Settings() {
   const theme = useSettingsStore((s) => s.theme);
   const setTheme = useSettingsStore((s) => s.setTheme);
@@ -296,7 +513,12 @@ export function Settings() {
         title="API Keys"
         description="Store provider API keys securely via the OS keychain."
       >
-        <ApiKeySection />
+        <div className="flex flex-col gap-3">
+          <ApiKeySection />
+          <ProviderApiKeySection provider="openai" label="OpenAI" placeholder="sk-..." />
+          <ProviderApiKeySection provider="google" label="Google" placeholder="AIza..." />
+          <ProviderApiKeySection provider="openrouter" label="OpenRouter" placeholder="sk-or-..." />
+        </div>
       </SettingsSection>
 
       <Separator />
@@ -306,6 +528,15 @@ export function Settings() {
         description="Choose default models and output limits for agent runs."
       >
         <ModelConfigSection />
+      </SettingsSection>
+
+      <Separator />
+
+      <SettingsSection
+        title="Model Roles"
+        description="Assign a specific model per responsibility — orchestration, coding, review, and utility calls."
+      >
+        <ModelRoleSection />
       </SettingsSection>
 
       <Separator />

@@ -34,10 +34,11 @@ use crate::os_adapter;
 use crate::secrets;
 use crate::state::AppState;
 
-use super::anthropic_client::{AnthropicClient, AssistantContentBlock, ContentBlockParam, MessageParam, StreamOutcome};
+use super::anthropic_client::{AssistantContentBlock, ContentBlockParam, MessageParam, StreamOutcome, ToolDefinition};
 use super::events as agent_events;
 use super::executor::{run_one_tool_call, ExecutedTool};
 use super::memory::{self as agent_memory, DEFAULT_RETRIEVAL_CAP};
+use super::provider::{self, ModelProvider};
 use super::schema::{all_tool_definitions, send_message_tool_definition, tool_definitions_for_names};
 use super::test_fix::{TestFixEvent, TestFixTracker};
 use super::tools::{MissionContext, ToolContext};
@@ -118,6 +119,14 @@ struct RunSetup {
     lint_command: Option<String>,
     build_command: Option<String>,
     model_max_tokens: u32,
+    /// Phase 5 M20: the `model_configs.provider` string for `agent_run.model_id`
+    /// (e.g. `"anthropic"`/`"openai"`/`"google"`/`"openrouter"`) — looked up
+    /// the same way `model_max_tokens` already was, just carrying the extra
+    /// column. Defaults to `"anthropic"` if no config row's `model_id` matches
+    /// (same honest fallback `model_max_tokens` already had), so a run
+    /// started before this milestone still resolves to exactly the provider
+    /// it always implicitly was.
+    provider: String,
     /// M13: `agent.max_test_fix_attempts` — see [`DEFAULT_MAX_TEST_FIX_ATTEMPTS`].
     max_test_fix_attempts: i64,
 }
@@ -163,11 +172,9 @@ fn load_run_setup(conn: &Connection, agent_run_id: &str) -> AppResult<RunSetup> 
     let build_command =
         non_empty(settings_repo::get(conn, &crate::project_detect::project_setting_key(&agent.project_id, "build_command"))?.map(|s| s.value));
 
-    let model_max_tokens = model_configs_repo::list(conn)?
-        .into_iter()
-        .find(|m| m.model_id == agent_run.model_id)
-        .map(|m| m.max_output_tokens as u32)
-        .unwrap_or(DEFAULT_MAX_TOKENS);
+    let matched_model_config = model_configs_repo::list(conn)?.into_iter().find(|m| m.model_id == agent_run.model_id);
+    let model_max_tokens = matched_model_config.as_ref().map(|m| m.max_output_tokens as u32).unwrap_or(DEFAULT_MAX_TOKENS);
+    let provider = matched_model_config.map(|m| m.provider).unwrap_or_else(|| "anthropic".to_string());
 
     let max_test_fix_attempts = settings_repo::get(conn, "agent.max_test_fix_attempts")?
         .and_then(|s| s.value.parse::<i64>().ok())
@@ -184,6 +191,7 @@ fn load_run_setup(conn: &Connection, agent_run_id: &str) -> AppResult<RunSetup> 
         lint_command,
         build_command,
         model_max_tokens,
+        provider,
         max_test_fix_attempts,
     })
 }
@@ -269,12 +277,12 @@ pub(crate) fn to_content_block_param(block: &AssistantContentBlock) -> ContentBl
 async fn call_with_retry(
     app: &AppHandle,
     agent_run_id: &str,
-    client: &AnthropicClient,
+    provider: &dyn ModelProvider,
     model: &str,
     max_tokens: u32,
     system: &str,
     messages: &[MessageParam],
-    tools: &[super::anthropic_client::ToolDefinition],
+    tools: &[ToolDefinition],
     cancel: &CancellationToken,
 ) -> AppResult<StreamOutcome> {
     let mut last_err: Option<AppError> = None;
@@ -289,18 +297,17 @@ async fn call_with_retry(
 
         let app_for_delta = app.clone();
         let run_id_for_delta = agent_run_id.to_string();
-        let result = client
-            .stream_turn(model, max_tokens, system, messages, tools, cancel, |text: &str| {
-                let _ = agent_events::message_delta(&app_for_delta, &run_id_for_delta, text);
-            })
-            .await;
+        let mut on_text_delta = move |text: &str| {
+            let _ = agent_events::message_delta(&app_for_delta, &run_id_for_delta, text);
+        };
+        let result = provider.stream_turn(model, max_tokens, system, messages, tools, cancel, &mut on_text_delta).await;
 
         match result {
             Ok(outcome) => return Ok(outcome),
             Err(e) => last_err = Some(e),
         }
     }
-    Err(last_err.unwrap_or_else(|| AppError::Other("Anthropic API request failed".to_string())))
+    Err(last_err.unwrap_or_else(|| AppError::Other("model provider API request failed".to_string())))
 }
 
 /// Derives the `(NotificationType, title, body)` for a terminal run outcome.
@@ -461,13 +468,23 @@ async fn run_agent_loop_inner(app: &AppHandle, agent_run_id: &str, cancel: &Canc
         )));
     }
 
+    // Phase 5 M20: the provider this run's resolved `model_configs` row
+    // names (`"anthropic"` for every run started before this milestone,
+    // since `load_run_setup` defaults to it the same honest way it always
+    // defaulted `model_max_tokens`) — resolved once, up front, exactly like
+    // every other per-run setting `load_run_setup` already reads.
+    let provider_name = setup.provider.clone();
+    let secret_key = provider::secret_key_for(&provider_name)?;
     // `keyring` is a synchronous OS call; run it on the blocking pool rather
     // than stalling this async task's worker thread.
-    let api_key = tauri::async_runtime::spawn_blocking(|| secrets::get_secret(secrets::ANTHROPIC_API_KEY))
+    let api_key = tauri::async_runtime::spawn_blocking(move || secrets::get_secret(secret_key))
         .await
         .map_err(|e| AppError::Other(format!("API key lookup panicked: {e}")))??;
     let Some(api_key) = api_key else {
-        let msg = "No Anthropic API key is configured. Add one in Settings, then start this run again.".to_string();
+        let msg = format!(
+            "No {} API key is configured. Add one in Settings, then start this run again.",
+            provider::display_name(&provider_name)
+        );
         finish_run(app, agent_run_id, AgentRunStatus::Failed, Some(AgentRunStopReason::Error), Some(msg.clone()), Some(&msg)).await?;
         return Ok(());
     };
@@ -503,7 +520,7 @@ async fn run_agent_loop_inner(app: &AppHandle, agent_run_id: &str, cancel: &Canc
     let browser_manager = app.state::<AppState>().browser_manager.clone();
     let screenshots_dir = app.state::<AppState>().screenshots_dir.clone();
 
-    let client = AnthropicClient::new(api_key)?;
+    let model_provider = provider::for_name(&provider_name, api_key)?;
     // Phase 5 M19: an agent created from a skill whose `tools_json` is an
     // explicit (possibly empty) subset — not the `["*"]` "all tools"
     // sentinel — gets exactly that subset offered, via the same
@@ -573,7 +590,7 @@ async fn run_agent_loop_inner(app: &AppHandle, agent_run_id: &str, cancel: &Canc
         let outcome = call_with_retry(
             app,
             agent_run_id,
-            &client,
+            model_provider.as_ref(),
             &model_id,
             setup.model_max_tokens,
             &system_prompt,
@@ -838,6 +855,7 @@ mod tests {
             lint_command: None,
             build_command: None,
             model_max_tokens: DEFAULT_MAX_TOKENS,
+            provider: "anthropic".to_string(),
             max_test_fix_attempts: DEFAULT_MAX_TEST_FIX_ATTEMPTS,
         }
     }

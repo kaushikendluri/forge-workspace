@@ -40,9 +40,12 @@ use serde_json::json;
 use tauri::{AppHandle, Manager};
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::anthropic_client::{AnthropicClient, MessageParam, StreamOutcome, ToolDefinition};
+use crate::agent::anthropic_client::{MessageParam, StreamOutcome, ToolDefinition};
+use crate::agent::model_resolution::{resolve_model_config, ModelRole};
+use crate::agent::provider::{self, ModelProvider};
 use crate::db::models::ProjectBrain;
-use crate::db::repository::{model_configs as model_configs_repo, project_brain as project_brain_repo, repositories as repositories_repo};
+use crate::db::repository::project_brain as project_brain_repo;
+use crate::db::repository::repositories as repositories_repo;
 use crate::error::{AppError, AppResult};
 use crate::git::{CommitInfo, GitCliService, GitService};
 use crate::orchestrator::planner::shallow_top_level_listing;
@@ -52,8 +55,6 @@ use crate::secrets;
 use crate::state::AppState;
 
 const SUBMIT_PROJECT_BRAIN_TOOL: &str = "submit_project_brain";
-const FALLBACK_MODEL_ID: &str = "claude-sonnet-5";
-const FALLBACK_MAX_TOKENS: u32 = 4096;
 
 /// How many of a README's leading lines are handed to the analysis prompt —
 /// enough for a real description/overview section without hauling in an
@@ -283,7 +284,7 @@ pub fn parse_project_brain_analysis(input: &serde_json::Value) -> AppResult<Proj
 /// ([`regenerate_brain`]) is responsible for surfacing that honestly rather
 /// than persisting a fabricated brain.
 pub async fn analyze_project(
-    client: &AnthropicClient,
+    client: &dyn ModelProvider,
     model: &str,
     max_tokens: u32,
     repo_root: &Path,
@@ -369,18 +370,20 @@ pub fn should_regenerate(existing_source_sha: Option<&str>, recent_commit_shas: 
 /// [`maybe_auto_regenerate`] once its own policy check says yes) decides
 /// *whether* to call this at all.
 pub async fn regenerate_brain(app: &AppHandle, project_id: &str) -> AppResult<ProjectBrain> {
-    let (repo_root, model_id, max_tokens) = {
+    let (repo_root, model_id, max_tokens, provider_name) = {
         let app = app.clone();
         let project_id = project_id.to_string();
-        tauri::async_runtime::spawn_blocking(move || -> AppResult<(PathBuf, String, u32)> {
+        tauri::async_runtime::spawn_blocking(move || -> AppResult<(PathBuf, String, u32, String)> {
             let state = app.state::<AppState>();
             let conn = state.db.get()?;
             let repository = repositories_repo::get_by_project_id(&conn, &project_id)?
                 .ok_or_else(|| AppError::NotFound(format!("no repository registered for project {project_id}")))?;
-            let default_model = model_configs_repo::get_default(&conn)?;
-            let model_id = default_model.as_ref().map(|m| m.model_id.clone()).unwrap_or_else(|| FALLBACK_MODEL_ID.to_string());
-            let max_tokens = default_model.map(|m| m.max_output_tokens as u32).unwrap_or(FALLBACK_MAX_TOKENS);
-            Ok((PathBuf::from(repository.root_path), model_id, max_tokens))
+            // Phase 5 M20: the Project Brain analysis is the `Utility` role
+            // (see `ModelRole::Utility`'s own docs for why it's not
+            // `Orchestrator`) — "configured role default, else the global
+            // default", same precedence every other role follows.
+            let model = resolve_model_config(&conn, ModelRole::Utility, None, None)?;
+            Ok((PathBuf::from(repository.root_path), model.model_id, model.max_output_tokens as u32, model.provider))
         })
         .await
         .map_err(|e| AppError::Other(format!("background task failed: {e}")))??
@@ -389,16 +392,18 @@ pub async fn regenerate_brain(app: &AppHandle, project_id: &str) -> AppResult<Pr
     // Same "fail loudly, never silently fabricate a result" pattern
     // `agent::tool_loop`/`orchestrator::planner`/`agent::reviewer` all use
     // before their own first model call.
-    let api_key = tauri::async_runtime::spawn_blocking(|| secrets::get_secret(secrets::ANTHROPIC_API_KEY))
+    let secret_key = provider::secret_key_for(&provider_name)?;
+    let api_key = tauri::async_runtime::spawn_blocking(move || secrets::get_secret(secret_key))
         .await
         .map_err(|e| AppError::Other(format!("API key lookup panicked: {e}")))??;
     let Some(api_key) = api_key else {
-        return Err(AppError::InvalidInput(
-            "No Anthropic API key is configured. Add one in Settings, then try again.".to_string(),
-        ));
+        return Err(AppError::InvalidInput(format!(
+            "No {} API key is configured. Add one in Settings, then try again.",
+            provider::display_name(&provider_name)
+        )));
     };
 
-    let client = AnthropicClient::new(api_key)?;
+    let client = provider::for_name(&provider_name, api_key)?;
     let os_adapter = os_adapter::current();
     let git_service: Box<dyn GitService> = Box::new(GitCliService::new(os_adapter.as_ref()));
     // No live progress to cancel mid-flight for a single structured-output
@@ -407,7 +412,7 @@ pub async fn regenerate_brain(app: &AppHandle, project_id: &str) -> AppResult<Pr
     // `mission_commands::create_mission`.
     let cancel = CancellationToken::new();
 
-    let analysis = analyze_project(&client, &model_id, max_tokens, &repo_root, git_service.as_ref(), &cancel).await?;
+    let analysis = analyze_project(client.as_ref(), &model_id, max_tokens, &repo_root, git_service.as_ref(), &cancel).await?;
 
     let source_commit_sha =
         git_service.log(&repo_root, 1).ok().and_then(|commits| commits.into_iter().next()).map(|c| c.sha).unwrap_or_default();
